@@ -1,0 +1,1012 @@
+// MortMortgage — Prisma schema (task-001).
+//
+// Source of truth: contracts.md §A / contracts.json `models` + `enums`; requirements.md §9 entity table.
+// Field names are camelCase exactly as in contracts.json — API models are the serialization of these rows.
+//
+// Conventions and deliberate decisions:
+// - UUID primary keys (`@default(uuid())`): the contract mandates UUID ids (requirements §9);
+//   this deliberately overrides the profile's cuid default.
+// - Every model carries createdAt/updatedAt.
+// - Encrypted-at-rest fields (NFR-002, AC-54) are stored as ciphertext Bytes plus a keyId column
+//   alongside each: Borrower.ssnCiphertext/ssnKeyId, Borrower.dateOfBirthCiphertext/dateOfBirthKeyId,
+//   MfaEnrollment.secretCiphertext/secretKeyId, BankLink.accessTokenCiphertext/accessTokenKeyId.
+//   Account numbers on assets / liabilities / REO mortgages live inside ApplicationData JSON documents;
+//   their ciphertext+keyId are embedded per record inside the JSON (a sibling column is impossible for
+//   array elements) — the encryption helper (task-002) owns that envelope shape.
+// - Borrower.ssnBlindIndex has a NON-unique index (INV-018): duplicate SSNs must be detectable
+//   (FraudFlag), never blocked.
+// - Enums: Prisma enum identifiers cannot contain hyphens. Contract enums whose values are all valid
+//   identifiers are declared as Prisma enums with values verbatim. The contract enums with hyphenated
+//   values that are stored as scalar columns (Citizenship, HousingStatus, EmploymentType, DocumentType,
+//   FraudFlagType, NotificationChannel, VersionReason, DenialReason) are stored as TEXT with a
+//   migration-level CHECK constraint enumerating the verbatim contract values — so the Prisma client
+//   reads/writes the exact contract literals with no renaming layer. Enums that only appear inside
+//   JSON documents (wizard section data) are validated at the boundary (zod) per contracts.json.
+// - DB-level invariants Prisma cannot express (functional unique lower(email), partial unique
+//   indexes, CHECK constraints, application_number_seq) live in the init migration SQL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums (values verbatim from contracts.json)
+// ---------------------------------------------------------------------------
+
+enum WorkflowState {
+  draft
+  application_received
+  completeness_validated
+  documents_received
+  aus_executed
+  preliminary_decision
+  escalated_review
+  conditional_approval
+  approved
+  denied
+  borrower_notified
+  revision_requested
+  suspended
+  withdrawn
+  declined_by_borrower
+}
+
+enum UserRole {
+  BORROWER
+  CASEWORKER
+  SUPERVISOR
+}
+
+enum UserStatus {
+  active
+  inactive
+}
+
+enum NotificationChannelPreference {
+  email
+  sms
+  both
+}
+
+enum Priority {
+  urgent
+  high
+  normal
+  low
+}
+
+enum Outcome {
+  approved
+  denied
+}
+
+enum MaritalStatus {
+  married
+  separated
+  unmarried
+}
+
+enum CreditType {
+  individual
+  joint
+}
+
+enum SignatureMode {
+  drawn
+  typed
+  demo
+}
+
+enum DocumentStatus {
+  pending
+  accepted
+  insufficient
+  waived
+}
+
+enum DocumentJobStatus {
+  queued
+  processing
+  completed
+  failed
+}
+
+enum CheckType {
+  credit
+  income
+  avm
+  pricing
+  aus
+}
+
+enum CheckStatus {
+  running
+  completed
+  error
+}
+
+enum RiskBadge {
+  green
+  yellow
+  red
+}
+
+enum FraudFlagSeverity {
+  low
+  medium
+  high
+}
+
+enum FraudFlagStatus {
+  open
+  resolved
+  dismissed
+}
+
+enum AssignmentMethod {
+  claim
+  manual
+  bulk
+  auto
+  reassign
+}
+
+enum NoteType {
+  internal
+  formal
+  chatter
+}
+
+enum ConditionStatus {
+  open
+  cleared
+}
+
+enum ApprovalDecision {
+  approve
+  deny
+}
+
+enum NotificationDeliveryStatus {
+  pending
+  sent
+  failed
+}
+
+enum ExternalChannel {
+  email
+  sms
+}
+
+enum MfaStatus {
+  enrolled
+  pending
+  reset
+}
+
+// ---------------------------------------------------------------------------
+// Identity & auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id                  String                        @id @default(uuid())
+  // Uniqueness is enforced case-insensitively via a functional unique index on lower(email)
+  // in the init migration (INV-013) — deliberately NOT a plain @unique here.
+  email               String
+  pendingEmail        String?
+  passwordHash        String
+  // Single role enum — exactly one of BORROWER/CASEWORKER/SUPERVISOR (INV-004).
+  role                UserRole
+  firstName           String
+  lastName            String
+  phone               String?
+  emailVerifiedAt     DateTime?
+  status              UserStatus                    @default(active)
+  passwordChangedAt   DateTime?
+  failedLoginCount    Int                           @default(0)
+  lockedUntil         DateTime?
+  notificationChannel NotificationChannelPreference @default(email)
+  smsVerifiedAt       DateTime?
+  isDemo              Boolean                       @default(false)
+  isSeed              Boolean                       @default(false)
+  lastSignInAt        DateTime?
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @updatedAt
+
+  applications             Application[]          @relation("ApplicationBorrowerUser")
+  sessions                 Session[]
+  mfaEnrollments           MfaEnrollment[]
+  passwordResetTokens      PasswordResetToken[]
+  passwordHistory          PasswordHistory[]
+  createdVersions          ApplicationVersion[]   @relation("VersionCreatedBy")
+  uploadedDocuments        Document[]             @relation("DocumentUploadedBy")
+  uploadedDocumentVersions DocumentVersion[]      @relation("DocumentVersionUploadedBy")
+  documentRequests         DocumentRequest[]      @relation("DocumentRequestRequestedBy")
+  requestedChecks          UnderwritingResult[]   @relation("CheckRequestedBy")
+  resolvedFraudFlags       FraudFlag[]            @relation("FraudFlagResolvedBy")
+  caseworkerAssignments    CaseworkerAssignment[] @relation("AssignmentCaseworker")
+  assignmentsMade          CaseworkerAssignment[] @relation("AssignmentAssignedBy")
+  approvalRecords          ApprovalRecord[]       @relation("ApprovalApprover")
+  clearedConditions        Condition[]            @relation("ConditionClearedBy")
+  workflowActions          WorkflowHistory[]      @relation("WorkflowActor")
+  applicationNotes         ApplicationNote[]      @relation("NoteAuthor")
+  auditLogEntries          AuditLogEntry[]        @relation("AuditActor")
+  notifications            Notification[]         @relation("NotificationRecipient")
+  configUpdates            SystemConfig[]         @relation("ConfigUpdatedBy")
+  seedRuns                 SeedRun[]              @relation("SeedRunCreatedBy")
+
+  @@index([role, status])
+  @@index([isSeed])
+}
+
+model Session {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  // Pre-MFA state (task-006/007, §4.1.4): non-null while the password has been verified but the
+  // MFA factor has not. A session with mfaPendingAt set NEVER authenticates through
+  // getSessionUser; POST /api/auth/mfa/verify (task-007) clears it on TOTP/recovery success.
+  // Also anchors the 10-minute enrollment-scoped window for mfa-enrollment-required sign-ins.
+  mfaPendingAt DateTime?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model MfaEnrollment {
+  id               String    @id @default(uuid())
+  userId           String
+  // TOTP secret at rest: AES-256-GCM ciphertext + key id (task-002 helper).
+  secretCiphertext Bytes
+  secretKeyId      String
+  status           MfaStatus @default(pending)
+  verifiedAt       DateTime?
+  // Array of { hash: string, usedAt: string | null } — hashed recovery codes with consumption marks (INV-010).
+  recoveryCodeHashes Json    @default("[]")
+  // Last accepted TOTP time step, for replay rejection.
+  lastUsedStep     Int?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  // 'reset' | 'verify-email' | 'verify-new-email' | 'invite' | 'sms-verify' — CHECK constraint in
+  // migrations (no contract enum exists; base values per requirements §9, 'verify-new-email' for the
+  // REQ-041 change-email re-verification flow and 'sms-verify' for the §4.2.12 SMS code, task-006).
+  purpose   String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+model PasswordHistory {
+  id           String   @id @default(uuid())
+  userId       String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// Persistent rate limiting (NFR-012 / SEC-11): survives restarts, shared across instances.
+model RateLimitBucket {
+  id          String   @id @default(uuid())
+  key         String
+  windowStart DateTime
+  count       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([key, windowStart])
+  @@index([windowStart])
+}
+
+// ---------------------------------------------------------------------------
+// Application core
+// ---------------------------------------------------------------------------
+
+model Application {
+  id                          String        @id @default(uuid())
+  // MM-YYYY-NNNNNN — sequence-backed (application_number_seq, INV-014); format applied in app code.
+  applicationNumber           String        @unique
+  // User.id of the owning Borrower (role BORROWER) — never a Borrower.id.
+  borrowerUserId              String
+  workflowState               WorkflowState @default(draft)
+  // Non-null iff workflowState = suspended (INV-032).
+  previousStateForSuspend     WorkflowState?
+  priority                    Priority      @default(normal)
+  priorityOverride            Boolean       @default(false)
+  // 0 while Draft; latest ApplicationVersion.versionNumber after submission (INV-008).
+  currentVersionNumber        Int           @default(0)
+  // Optimistic-concurrency stamp; every write must echo it, stale => 409 (INV-039, NFR-026).
+  versionStamp                Int           @default(0)
+  submittedAt                 DateTime?
+  decidedAt                   DateTime?
+  // Set in the T27/T28 transaction; drives Borrower Notified bi-modality (INV-022).
+  outcome                     Outcome?
+  stateEnteredAt              DateTime      @default(now())
+  slaPausedAt                 DateTime?
+  revisionCycles              Int           @default(0)
+  escalationRequired          Boolean       @default(false)
+  // Human-readable criteria labels evaluated at the L1 decision moment.
+  escalationCriteriaMet       String[]      @default([])
+  dti                         Decimal?      @db.Decimal(8, 4)
+  ltv                         Decimal?      @db.Decimal(8, 4)
+  cltv                        Decimal?      @db.Decimal(8, 4)
+  ausStale                    Boolean       @default(false)
+  // task-019 (T15, VR-082/WF-017): RecommendationValue recorded at aus_executed ->
+  // preliminary_decision; read by the approval gate/panel (task-020/032). TEXT +
+  // CHECK (verbatim RecommendationValue values) in migration. Not a §A wire field.
+  preliminaryRecommendation   String?
+  isSeed                      Boolean       @default(false)
+  copiedFromApplicationId     String?
+  decisionNotificationPending Boolean       @default(false)
+  // SEC-21 / NFR-022 (task-011): client-generated idempotency token from
+  // CreateApplicationRequest.requestToken. Unique per borrower (composite unique below;
+  // Postgres ignores NULLs) so a replayed create returns the existing application and a
+  // concurrent duplicate create loses the insert race (P2002) instead of double-creating.
+  createRequestToken          String?
+  // REQ-022 (task-011): persistent section-copy staleness advisories — JSON array of
+  // { section: WizardSection, sourceSavedAt: ISO, message: string }. An entry persists
+  // until the borrower edits that section or confirms it (VR-068); serialized on
+  // SectionSaveResponse.staleCopyAdvisories as the message strings.
+  staleCopyAdvisories         Json          @default("[]")
+  createdAt                   DateTime      @default(now())
+  updatedAt                   DateTime      @updatedAt
+
+  borrowerUser User          @relation("ApplicationBorrowerUser", fields: [borrowerUserId], references: [id], onDelete: Restrict)
+  copiedFrom   Application?  @relation("ApplicationCopiedFrom", fields: [copiedFromApplicationId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  copies       Application[] @relation("ApplicationCopiedFrom")
+
+  borrowers           Borrower[]
+  data                ApplicationData?
+  versions            ApplicationVersion[]
+  documents           Document[]
+  documentRequests    DocumentRequest[]
+  signatures          Signature[]
+  bankLinks           BankLink[]
+  underwritingResults UnderwritingResult[]
+  fraudFlags          FraudFlag[]
+  assignments         CaseworkerAssignment[]
+  approvalRecords     ApprovalRecord[]
+  conditions          Condition[]
+  workflowHistory     WorkflowHistory[]
+  notes               ApplicationNote[]
+  auditLogEntries     AuditLogEntry[]
+  notifications       Notification[]
+
+  // One-active partial unique index on (borrowerUserId) over active states 2-13 lives in the
+  // init migration (INV-016).
+  @@unique([borrowerUserId, createRequestToken])
+  @@index([borrowerUserId])
+  @@index([workflowState])
+  @@index([workflowState, decidedAt, submittedAt])
+  @@index([priority])
+  @@index([isSeed])
+  @@index([updatedAt])
+  @@index([copiedFromApplicationId])
+}
+
+model Borrower {
+  id            String  @id @default(uuid())
+  applicationId String
+  // 1 = primary borrower, 2 = co-borrower — CHECK (ordinal IN (1,2)) in migration (INV-035).
+  ordinal       Int
+  firstName     String?
+  middleName    String?
+  lastName      String?
+  suffix        String?
+  alternateNames String[] @default([])
+
+  // SSN at rest (NFR-002): ciphertext + key id; last4 for masked display; HMAC blind index for
+  // duplicate detection. Blind index is NON-unique by design (INV-018).
+  ssnCiphertext Bytes?
+  ssnKeyId      String?
+  ssnLast4      String?
+  ssnBlindIndex String?
+
+  // DOB at rest: ciphertext + key id (display string derived on read, SEC-2).
+  dateOfBirthCiphertext Bytes?
+  dateOfBirthKeyId      String?
+
+  // TEXT + CHECK (verbatim Citizenship enum values) in migration.
+  citizenship    String?
+  maritalStatus  MaritalStatus?
+  dependentsCount Int?
+  dependentsAges String?
+  homePhone      String?
+  cellPhone      String?
+  workPhone      String?
+  workPhoneExt   String?
+  email          String?
+  creditType     CreditType?
+  // MilitaryService shape (contracts.json).
+  militaryService Json?
+  // Address shape (contracts.json).
+  currentAddress Json?
+  // TEXT + CHECK (verbatim HousingStatus enum values) in migration.
+  housingStatus  String?
+  monthlyRent    Decimal? @db.Decimal(12, 2)
+  yearsAtAddress Int?
+  monthsAtAddress Int?
+  // PreviousAddress[] shape.
+  previousAddresses Json?
+  // Address shape.
+  mailingAddress Json?
+  // TEXT + CHECK (verbatim EmploymentType enum values) in migration.
+  employmentType String?
+  // EmploymentRecord[] shape.
+  employments    Json?
+  // PreviousEmploymentRecord[] shape.
+  previousEmployments Json?
+  // OtherIncomeRecord[] shape.
+  otherIncome    Json?
+  // Declarations shape (A..M).
+  declarations   Json?
+  // Demographics shape.
+  demographics   Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  signatures  Signature[]
+  bankLinks   BankLink[]
+
+  @@unique([applicationId, ordinal])
+  @@index([ssnBlindIndex])
+}
+
+// 1-1 shared (not per-borrower) URLA sections (contracts.md §A ApplicationData).
+// Array/object fields hold the contracts.json shapes as JSON documents; account numbers inside
+// assets / realEstateOwned[].mortgages / liabilities are stored as embedded ciphertext+keyId
+// envelopes written by the task-002 encryption helper.
+model ApplicationData {
+  id            String @id @default(uuid())
+  applicationId String @unique
+  // AssetRecord[]
+  assets        Json?
+  // OtherCreditRecord[]
+  otherCredits  Json?
+  // RealEstateOwnedRecord[]
+  realEstateOwned Json?
+  // LiabilityRecord[]
+  liabilities   Json?
+  // OtherLiabilityRecord[]
+  otherLiabilities Json?
+  // SubjectProperty
+  subjectProperty Json?
+  // LoanDetails — loanTermMonths CHECK IN (120,180,240,360) enforced in migration (INV-025).
+  loan          Json?
+  // ProposedHousingExpense
+  proposedHousingExpense Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+model ApplicationVersion {
+  id              String   @id @default(uuid())
+  applicationId   String
+  versionNumber   Int
+  // Immutable full application snapshot (INV-008); encrypted fields stored masked/encrypted.
+  snapshot        Json
+  // 'initial-submission' | 'resubmission' — TEXT + CHECK (verbatim VersionReason values) in migration.
+  reason          String
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  createdByUser User?       @relation("VersionCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([applicationId, versionNumber])
+  @@index([createdByUserId])
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+model Document {
+  id               String         @id @default(uuid())
+  applicationId    String
+  // TEXT + CHECK (verbatim DocumentType enum values) in migration.
+  documentType     String
+  description      String?
+  checklistItemKey String?
+  status           DocumentStatus @default(pending)
+  statusReason     String?
+  // Points into this document's own version set; nullable only inside the creation transaction
+  // (INV-007 — service keeps it non-null and in-set).
+  currentVersionId String?
+  uploadedByUserId String?
+  isSeed           Boolean        @default(false)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  application    Application      @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  currentVersion DocumentVersion? @relation("DocumentCurrentVersion", fields: [currentVersionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  uploadedByUser User?            @relation("DocumentUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  versions       DocumentVersion[] @relation("DocumentVersions")
+  fulfilledRequests DocumentRequest[] @relation("DocumentRequestFulfilledBy")
+
+  @@index([applicationId, status])
+  @@index([currentVersionId])
+  @@index([uploadedByUserId])
+  @@index([isSeed])
+}
+
+model DocumentVersion {
+  id                String   @id @default(uuid())
+  documentId        String
+  versionNumber     Int
+  storageKey        String
+  originalFileName  String
+  sniffedContentType String
+  sizeBytes         Int
+  sha256            String?
+  uploadedByUserId  String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  document          Document  @relation("DocumentVersions", fields: [documentId], references: [id], onDelete: Cascade)
+  uploadedByUser    User?     @relation("DocumentVersionUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  currentOfDocuments Document[] @relation("DocumentCurrentVersion")
+  jobs              DocumentJob[]
+  ocrExtractions    OcrExtraction[]
+  fraudFlags        FraudFlag[] @relation("FraudFlagSourceDocumentVersion")
+
+  @@unique([documentId, versionNumber])
+  @@index([uploadedByUserId])
+}
+
+model DocumentJob {
+  id                String            @id @default(uuid())
+  documentVersionId String
+  status            DocumentJobStatus @default(queued)
+  attempt           Int               @default(0)
+  maxAttempts       Int               @default(5)
+  provider          String?
+  startedAt         DateTime?
+  finishedAt        DateTime?
+  error             String?
+  // task-034 (ASYNC-001): persisted exponential-backoff schedule — when a failed
+  // attempt becomes due for automatic requeue (failed -> queued). NULL = no
+  // automatic retry pending. A partial unique index (migration 20260829130000)
+  // additionally enforces at most one active (queued/processing) job per
+  // document version — serial-per-key.
+  nextRetryAt       DateTime?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Cascade)
+
+  // Stuck-job reconciler scan (WALK-001).
+  @@index([status, startedAt])
+  // Due-retry scan (task-034 scheduler).
+  @@index([status, nextRetryAt])
+  @@index([documentVersionId])
+}
+
+model OcrExtraction {
+  id                String   @id @default(uuid())
+  documentVersionId String
+  provider          String
+  // OcrFieldResult[] shape (contracts.json).
+  fields            Json
+  rawText           String?  @db.Text
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Cascade)
+
+  @@index([documentVersionId])
+}
+
+model DocumentRequest {
+  id                    String   @id @default(uuid())
+  applicationId         String
+  // TEXT + CHECK (verbatim DocumentType enum values) in migration.
+  documentType          String
+  reason                String
+  requestedByUserId     String?
+  // Same-application reference discipline enforced in service layer (INV-021).
+  fulfilledByDocumentId String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  application         Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  requestedByUser     User?       @relation("DocumentRequestRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  fulfilledByDocument Document?   @relation("DocumentRequestFulfilledBy", fields: [fulfilledByDocumentId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId])
+  @@index([requestedByUserId])
+  @@index([fulfilledByDocumentId])
+}
+
+// ---------------------------------------------------------------------------
+// Signatures & bank links
+// ---------------------------------------------------------------------------
+
+model Signature {
+  id                 String        @id @default(uuid())
+  applicationId      String
+  // Borrower.id (the borrower row on this application, not a User.id).
+  borrowerId         String
+  mode               SignatureMode
+  // PNG image bytes (drawn/typed render), <= 200 KB (INV-024).
+  imageData          Bytes?
+  attestationText    String        @db.Text
+  attestationVersion String?
+  signedAt           DateTime
+  ip                 String?
+  userAgent          String?
+  // Hash of the signed data snapshot; any post-signing edit invalidates (INV-029, XBR-003).
+  dataHash           String
+  invalidatedAt      DateTime?
+  demoBypass         Boolean       @default(false)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  borrower    Borrower    @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, invalidatedAt])
+  @@index([borrowerId])
+}
+
+model BankLink {
+  id                    String    @id @default(uuid())
+  applicationId         String
+  borrowerId            String?
+  provider              String
+  institution           String
+  // Aggregator access token at rest: ciphertext + key id; removed on unlink.
+  accessTokenCiphertext Bytes?
+  accessTokenKeyId      String?
+  linkedAt              DateTime  @default(now())
+  unlinkedAt            DateTime?
+  importedAccountIds    String[]  @default([])
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  borrower    Borrower?   @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([borrowerId])
+}
+
+// ---------------------------------------------------------------------------
+// Underwriting, fraud, assignment, approval
+// ---------------------------------------------------------------------------
+
+model UnderwritingResult {
+  id                String      @id @default(uuid())
+  applicationId     String
+  checkType         CheckType
+  status            CheckStatus @default(running)
+  provider          String?
+  requestedByUserId String?
+  requestedAt       DateTime    @default(now())
+  completedAt       DateTime?
+  // Full typed result payload (CreditCheckResult / IncomeCheckResult / AvmCheckResult /
+  // PricingCheckResult / AusCheckResult per checkType).
+  result            Json?
+  summary           String?
+  riskBadge         RiskBadge?
+  isStale           Boolean     @default(false)
+  supersededById    String?
+  error             String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  application     Application          @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  requestedByUser User?                @relation("CheckRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  supersededBy    UnderwritingResult?  @relation("ResultSupersededBy", fields: [supersededById], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  supersedes      UnderwritingResult[] @relation("ResultSupersededBy")
+  fraudFlags      FraudFlag[]          @relation("FraudFlagSourceResult")
+
+  @@index([applicationId, checkType, status])
+  @@index([requestedByUserId])
+  @@index([supersededById])
+}
+
+model FraudFlag {
+  id                      String            @id @default(uuid())
+  applicationId           String
+  // TEXT + CHECK (verbatim FraudFlagType enum values) in migration.
+  type                    String
+  severity                FraudFlagSeverity
+  sourceDocumentVersionId String?
+  sourceResultId          String?
+  details                 String            @db.Text
+  status                  FraudFlagStatus   @default(open)
+  resolvedByUserId        String?
+  resolutionNote          String?
+  resolvedAt              DateTime?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  application           Application         @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  sourceDocumentVersion DocumentVersion?    @relation("FraudFlagSourceDocumentVersion", fields: [sourceDocumentVersionId], references: [id], onDelete: SetNull)
+  sourceResult          UnderwritingResult? @relation("FraudFlagSourceResult", fields: [sourceResultId], references: [id], onDelete: SetNull)
+  resolvedByUser        User?               @relation("FraudFlagResolvedBy", fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, status, severity])
+  @@index([sourceDocumentVersionId])
+  @@index([sourceResultId])
+  @@index([resolvedByUserId])
+}
+
+model CaseworkerAssignment {
+  id               String           @id @default(uuid())
+  applicationId    String
+  caseworkerUserId String
+  assignedByUserId String?
+  method           AssignmentMethod
+  reason           String?
+  assignedAt       DateTime         @default(now())
+  endedAt          DateTime?
+  endReason        String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  caseworkerUser User        @relation("AssignmentCaseworker", fields: [caseworkerUserId], references: [id], onDelete: Restrict)
+  assignedByUser User?       @relation("AssignmentAssignedBy", fields: [assignedByUserId], references: [id], onDelete: SetNull)
+
+  // Partial unique index (applicationId) WHERE "endedAt" IS NULL lives in the init migration (INV-015).
+  @@index([applicationId])
+  // Auto-assign workload counting (WALK-007).
+  @@index([caseworkerUserId, endedAt])
+  @@index([assignedByUserId])
+}
+
+model ApprovalRecord {
+  id             String           @id @default(uuid())
+  applicationId  String
+  // 1 or 2 — CHECK (level IN (1,2)) in migration.
+  level          Int
+  decision       ApprovalDecision
+  approverUserId String
+  notes          String?          @db.Text
+  // DenialReason[] — TEXT[] + element CHECK (verbatim DenialReason enum values) in migration.
+  denialReasons  String[]         @default([])
+  denialReasonOtherText String?
+  // Human-readable escalation criteria labels evaluated at decision time (XBR-009).
+  criteriaEvaluated String[]      @default([])
+  dtiAtDecision  Decimal?         @db.Decimal(8, 4)
+  ltvAtDecision  Decimal?         @db.Decimal(8, 4)
+  versionNumber  Int
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  application  Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  approverUser User        @relation("ApprovalApprover", fields: [approverUserId], references: [id], onDelete: Restrict)
+  conditions   Condition[]
+
+  // INV-017: a given approval level is DECIDED at most once per application version.
+  // Enforced by TWO PARTIAL unique indexes in migration
+  // `approval_decision_partial_unique` (raw SQL — same pattern as the INV-016
+  // partial index): unique (applicationId, versionNumber, level) WHERE
+  // decision='approve', and the same WHERE decision='deny'. A FULL unique here
+  // would make the contracted T31/T40 deny record (WF-037/WF-046: "deny
+  // ApprovalRecord at the highest level previously required") unwritable, since
+  // that level already holds the approve record that produced
+  // conditional_approval. The split preserves INV-017's stated purpose — a
+  // later approve can never shadow an earlier deny (approve slot still unique,
+  // and any deny at a level permanently disqualifies it in the gate, INV-028)
+  // — while the index remains the race authority for concurrent same-decision
+  // attempts (P2002 → 409) and the versionStamp guard serializes
+  // approve-vs-deny races (task-020).
+  @@index([applicationId, versionNumber, level])
+  @@index([approverUserId])
+}
+
+model Condition {
+  id               String          @id @default(uuid())
+  applicationId    String
+  approvalRecordId String
+  text             String          @db.Text
+  status           ConditionStatus @default(open)
+  clearedByUserId  String?
+  clearedAt        DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  application    Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  approvalRecord ApprovalRecord @relation(fields: [approvalRecordId], references: [id], onDelete: Cascade)
+  clearedByUser  User?          @relation("ConditionClearedBy", fields: [clearedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, status])
+  @@index([approvalRecordId])
+  @@index([clearedByUserId])
+}
+
+// ---------------------------------------------------------------------------
+// History, notes, audit, notifications
+// ---------------------------------------------------------------------------
+
+model WorkflowHistory {
+  id            String        @id @default(uuid())
+  applicationId String
+  fromState     WorkflowState
+  toState       WorkflowState
+  // Null for SYSTEM transitions (T27/T28 etc.).
+  actorUserId   String?
+  actorRole     String
+  note          String?
+  versionNumber Int?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  application Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  actorUser   User?             @relation("WorkflowActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  notes       ApplicationNote[] @relation("NoteRelatedTransition")
+
+  // Per-application SLA computation walk (WALK-003).
+  @@index([applicationId, createdAt])
+  @@index([actorUserId])
+}
+
+model ApplicationNote {
+  id                  String   @id @default(uuid())
+  applicationId       String
+  authorUserId        String
+  type                NoteType
+  content             String   @db.Text
+  relatedTransitionId String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  application       Application      @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  authorUser        User             @relation("NoteAuthor", fields: [authorUserId], references: [id], onDelete: Restrict)
+  relatedTransition WorkflowHistory? @relation("NoteRelatedTransition", fields: [relatedTransitionId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, type, createdAt])
+  @@index([authorUserId])
+  @@index([relatedTransitionId])
+}
+
+// Append-only (INV-009): no update/delete code path exists; the sole exception is
+// seed-flagged rows removed by Remove Demo Data. Application FK is SetNull so audit
+// rows survive draft deletion.
+model AuditLogEntry {
+  id            String   @id @default(uuid())
+  timestamp     DateTime @default(now())
+  actorUserId   String?
+  actorRole     String?
+  actionType    String
+  applicationId String?
+  entityType    String?
+  entityId      String?
+  summary       String   @db.Text
+  before        Json?
+  after         Json?
+  reason        String?
+  ip            String?
+  requestId     String?
+  isSeed        Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  actorUser   User?        @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  application Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  @@index([timestamp])
+  @@index([applicationId])
+  @@index([actorUserId])
+  @@index([actionType])
+  @@index([isSeed])
+}
+
+model Notification {
+  id              String                     @id @default(uuid())
+  recipientUserId String
+  type            String
+  title           String
+  body            String                     @db.Text
+  applicationId   String?
+  // 'in-app' | 'email' | 'sms' — TEXT + CHECK (verbatim NotificationChannel enum values) in migration.
+  channel         String
+  deliveryStatus  NotificationDeliveryStatus @default(pending)
+  deliveryError   String?
+  // ASM-009 / ASYNC-002 retry bookkeeping (task-036): completed external delivery
+  // attempts and the persisted backoff schedule (nextAttemptAt) driving the
+  // WALK-002 retry scan. In-app-only rows keep 0 / null.
+  deliveryAttempts Int                       @default(0)
+  nextAttemptAt   DateTime?
+  readAt          DateTime?
+  createdAt       DateTime                   @default(now())
+  updatedAt       DateTime                   @updatedAt
+
+  recipientUser User         @relation("NotificationRecipient", fields: [recipientUserId], references: [id], onDelete: Cascade)
+  application   Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  outboundMessages OutboundMessage[]
+
+  @@index([recipientUserId, readAt])
+  // Notification retry scan (WALK-002).
+  @@index([deliveryStatus, createdAt])
+  @@index([applicationId])
+}
+
+model OutboundMessage {
+  id             String                     @id @default(uuid())
+  channel        ExternalChannel
+  recipient      String
+  subject        String?
+  body           String                     @db.Text
+  notificationId String?
+  status         NotificationDeliveryStatus @default(pending)
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  notification Notification? @relation(fields: [notificationId], references: [id], onDelete: SetNull)
+
+  @@index([notificationId])
+  @@index([status, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Config & seed bookkeeping
+// ---------------------------------------------------------------------------
+
+model SystemConfig {
+  id              String   @id @default(uuid())
+  key             String   @unique
+  // JSON-encoded value; validated per key by the config service (task-004).
+  value           Json
+  description     String?
+  updatedByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  updatedByUser User? @relation("ConfigUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([updatedByUserId])
+}
+
+model SeedRun {
+  id              String    @id @default(uuid())
+  createdByUserId String?
+  // JSON object of per-entity record counts.
+  recordCounts    Json
+  removedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  createdByUser User? @relation("SeedRunCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdByUserId])
+}

@@ -1,0 +1,118 @@
+# Client deliverable (task-045 — §7.1, AC-53): full local stack —
+# PostgreSQL + MinIO (S3-compatible storage emulator) + web app + worker.
+#
+#   docker compose up -d --build
+#   docker compose exec worker npm run db:setup     # one-command migrate + seed
+#
+# Host ports (chosen to avoid this workspace's existing services — a shared
+# Postgres on 5432 and dev servers on 3000/3083):
+#   5433 -> Postgres 5432 | 9000/9001 -> MinIO API/console | 3085 -> app 3083
+#
+# Secrets come from the operator's untracked `.env` in this directory (compose
+# interpolation) — never from this file. See .env.example for every variable.
+# DEMO_MODE defaults to true HERE ONLY because this compose file is the local
+# demonstration bring-up (AC-53: demonstration-ready after one migrate+seed);
+# production deployments keep DEMO_MODE off (DEPLOYMENT.md).
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${DB_NAME:-mortgage_v3}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot bucket bootstrap (scripts/s3-create-bucket.ts) — idempotent.
+  storage-init:
+    build:
+      context: .
+      target: worker
+    restart: "no"
+    command: ["npm", "run", "storage:init"]
+    environment:
+      STORAGE_PROVIDER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-mortmortgage-documents}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_FORCE_PATH_STYLE: "true"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      target: runner
+    ports:
+      - "3085:3083"
+    environment: &app-env
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/${DB_NAME:-mortgage_v3}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      APP_BASE_URL: ${COMPOSE_APP_BASE_URL:-http://localhost:3085}
+      TRUST_PROXY: "false"
+      STORAGE_PROVIDER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-mortmortgage-documents}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_FORCE_PATH_STYLE: "true"
+      # Secrets — required, interpolated from the untracked .env (never committed).
+      FIELD_ENCRYPTION_KEYS: ${FIELD_ENCRYPTION_KEYS:?set in .env — see .env.example}
+      FIELD_ENCRYPTION_ACTIVE_KEY_ID: ${FIELD_ENCRYPTION_ACTIVE_KEY_ID:?set in .env — see .env.example}
+      SSN_BLIND_INDEX_KEY: ${SSN_BLIND_INDEX_KEY:?set in .env — see .env.example}
+      CSRF_SECRET: ${CSRF_SECRET:?set in .env — see .env.example}
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      <<: *app-env
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-20000}
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  miniodata:

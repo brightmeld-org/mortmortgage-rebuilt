@@ -1,0 +1,8 @@
+{
+  "//": "Operator/maintenance scripts compile under the app's real settings. They import src/ modules (crypto, storage, signature-validity) which use the @/* path alias, so a standalone synthesized tsconfig without `paths` reports phantom TS2307s. Extends the app tsconfig to inherit paths/lib/strictness and scopes the file set to this directory.",
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["./**/*.ts", "../next-env.d.ts"]
+}

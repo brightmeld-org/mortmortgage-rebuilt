@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens — sourced from the operator-approved frame (frame/artifact.html
+ * :root palette + frame/gui-spec.md). Paper ground, white cards, deep navy for
+ * primary actions, copper as the single brand accent, semantic green/red/
+ * yellow/blue pairs for badges and banners. Fonts: Fraunces (display serif,
+ * headings) + Public Sans (UI), self-hosted via next/font in src/app/layout.tsx
+ * (CSP font-src 'self' — no external font hosts).
+ */
+@theme {
+  /* Fonts (next/font variables injected on <html>) */
+  --font-sans: var(--font-public-sans), "Public Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-display: var(--font-fraunces), "Fraunces", Georgia, "Times New Roman", serif;
+
+  /* Frame palette (frame/artifact.html) */
+  --color-paper: #f6f4ef;
+  --color-card: #ffffff;
+  --color-ink: #1d2733;
+  --color-ink-soft: #4c5a68;
+  --color-muted: #5b6673;
+  --color-line: #e4dfd4;
+  --color-navy: #24425e;
+  --color-navy-deep: #182c3f;
+  --color-copper: #94501a;
+  --color-copper-soft: #f3e5d8;
+  --color-success: #276b44;
+  --color-success-soft: #e3f0e8;
+  --color-danger: #b3372b;
+  --color-danger-soft: #f6e2df;
+  --color-warn: #856011;
+  --color-warn-soft: #f7edd3;
+  --color-info: #2b5e8c;
+  --color-info-soft: #e1ecf4;
+  --color-gray-soft: #ebedef;
+}

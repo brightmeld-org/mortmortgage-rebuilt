@@ -1,0 +1,50 @@
+{
+  "name": "mortmortgage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MortMortgage Mortgage Application Management System",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "dev": "next dev -p 3083",
+    "build": "next build",
+    "start": "next start -p 3083",
+    "worker": "tsx --env-file-if-exists=.env src/worker/index.ts",
+    "db:setup": "prisma migrate deploy && prisma db seed",
+    "storage:init": "tsx --env-file-if-exists=.env scripts/s3-create-bucket.ts",
+    "test": "tsx --env-file=.env --test --test-concurrency=1 \"task-046/suites/*.test.ts\"",
+    "test:coverage": "node -e \"require('node:fs').mkdirSync('coverage',{recursive:true})\" && tsx --env-file=.env --test --test-concurrency=1 --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \"task-046/suites/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "coverage:src": "node scripts/coverage-report.mjs --in coverage/server-v8 --out coverage/src-lcov.info",
+    "typecheck": "tsc --noEmit",
+    "audit:ci": "npm audit --audit-level=high"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.16.0",
+    "argon2": "^0.45.1",
+    "clsx": "^2.1.1",
+    "next": "^15.5.0",
+    "otpauth": "^9.5.1",
+    "qrcode": "^1.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/postcss": "^4.1.0",
+    "@types/node": "^24.3.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "postcss": "^8.5.0",
+    "prisma": "^6.16.0",
+    "tailwindcss": "^4.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

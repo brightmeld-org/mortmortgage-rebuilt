@@ -1,0 +1,17 @@
+node_modules/
+.next/
+.turbo/
+dist/
+*.pyc
+*.sqlite3
+.env
+coverage/
+.DS_Store
+.smoke-pid
+storage/*
+!storage/.gitkeep
+*.tsbuildinfo
+next-env.d.ts
+task-047/.auth/
+task-047/artifacts/
+task-047/results.json

@@ -1,0 +1,311 @@
+# MortMortgage — CI (§7.7 Testing, NFR-028)
+#
+# NFR-028 requires four things. This workflow is where each one is enforced:
+#
+#   1. "unit/integration tests (real PostgreSQL in CI)"  -> the `postgres:16-alpine`
+#      SERVICE CONTAINER below plus the `task-046` step. Nothing is mocked at the
+#      database boundary; the suite talks to a real server talking to real Postgres.
+#   2. "end-to-end browser tests per named role journeys plus public tools"
+#      -> the `task-047` Playwright step (real Chromium).
+#   3. "CI runs on every change with coverage report"    -> `on: [push, pull_request]`
+#      plus the `npm run test:coverage` step and the uploaded `coverage/` artifact.
+#   4. "suite passes clean with zero external keys"      -> the env block below.
+#      Every value is either a non-secret flag or a THROWAWAY key generated in-run.
+#      There is not one `secrets.*` reference in this file, and there must never be:
+#      all five integrations (credit, AVM, income, pricing/AUS, OCR, address, bank
+#      link, email, SMS) run in their contracted simulation mode, which is what the
+#      absence of provider credentials selects.
+#
+# Honest scope note: this file is the CI descriptor. Its steps are the same commands
+# that are run locally against the same Postgres image; but a GitHub Actions run of
+# this workflow has NOT been executed as part of the change that introduced it.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref — the suites are serial and long.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The §7.7 suite: typecheck -> migrate -> seed -> build -> serve -> task-046
+  # (unit/integration, with coverage) -> task-047 (end-to-end browser).
+  #
+  # One job, not two, on purpose: both suites drive the SAME running application
+  # instance over HTTP, exactly as they do locally. Splitting them would mean
+  # standing the stack up twice and would still not let them share a server.
+  # ---------------------------------------------------------------------------
+  test:
+    name: "§7.7 suite (real PostgreSQL, coverage)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    services:
+      # NFR-028 "real PostgreSQL in CI". Same major version as docker-compose.yml,
+      # same credentials and database name as the documented local stack, so the
+      # DATABASE_URL below is the local one with the host swapped.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: brightmeld
+          POSTGRES_PASSWORD: brightmeld
+          POSTGRES_DB: mortgage_v3
+        ports:
+          - 5432:5432
+        # Without this the first `prisma migrate deploy` races the server's own
+        # bootstrap restart and fails with ECONNREFUSED.
+        options: >-
+          --health-cmd "pg_isready -U brightmeld -d mortgage_v3"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      # --- Non-secret configuration (mirrors the delivered .env.example) ---
+      DATABASE_URL: postgresql://brightmeld:brightmeld@localhost:5432/mortgage_v3
+      # AC-53 / §10: the acceptance instance is demonstrated with DEMO_MODE=true.
+      # The task-047 setup project also depends on the §4.6.12 demo seed.
+      DEMO_MODE: "true"
+      APP_BASE_URL: http://localhost:3083
+      # Local-disk storage provider: no S3/MinIO, therefore no storage credentials.
+      STORAGE_DIR: ./storage
+      # No proxy in front of the runner, so the socket-address posture applies (INV-042).
+      TRUST_PROXY: "false"
+      TRUST_PROXY_HOP_COUNT: "1"
+      # The task-046 helpers and playwright.config.ts both default to :3083; set
+      # explicitly so a change of port here is a one-line change.
+      TEST_BASE_URL: http://localhost:3083
+      E2E_BASE_URL: http://localhost:3083
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json engines: ">=22 <25". 24.x is the delivered/validated line.
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies (locked)
+        # `npm ci` — not `npm install` — so the delivered package-lock.json is the
+        # exact tree under test. This also enforces the dependency freeze.
+        run: npm ci
+
+      # -----------------------------------------------------------------------
+      # Throwaway key material.
+      #
+      # The app fails fast without these (src/lib/crypto/encryption.ts throws on a
+      # missing FIELD_ENCRYPTION_KEYS; src/lib/csrf.ts and
+      # src/lib/services/handoff-token.ts throw in production without a secret), so
+      # CI must supply them. They are generated fresh every run and never leave the
+      # runner. They are NOT external service keys — NFR-028's "zero external keys"
+      # is about provider credentials, and there are none anywhere in this file.
+      #
+      # Written to `.env` because the delivered `test` / `test:coverage` scripts run
+      # `tsx --env-file=.env` and Node's --env-file is a hard error on a missing
+      # file. Next.js reads the same `.env`. `.env` is gitignored — writing it here
+      # is the CI equivalent of the operator's local one.
+      # -----------------------------------------------------------------------
+      - name: Generate throwaway key material (no external service keys)
+        run: |
+          FIELD_KEY="$(openssl rand -base64 32)"
+          BLIND_KEY="$(openssl rand -base64 32)"
+          CSRF="$(openssl rand -base64 32)"
+          HANDOFF="$(openssl rand -base64 32)"
+          {
+            echo "DATABASE_URL=${DATABASE_URL}"
+            echo "DEMO_MODE=${DEMO_MODE}"
+            echo "APP_BASE_URL=${APP_BASE_URL}"
+            echo "STORAGE_DIR=${STORAGE_DIR}"
+            echo "TRUST_PROXY=${TRUST_PROXY}"
+            echo "TRUST_PROXY_HOP_COUNT=${TRUST_PROXY_HOP_COUNT}"
+            echo "FIELD_ENCRYPTION_KEYS={\"ci1\":\"${FIELD_KEY}\"}"
+            echo "FIELD_ENCRYPTION_ACTIVE_KEY_ID=ci1"
+            echo "SSN_BLIND_INDEX_KEY=${BLIND_KEY}"
+            echo "CSRF_SECRET=${CSRF}"
+            echo "HANDOFF_TOKEN_SECRET=${HANDOFF}"
+          } > .env
+          # Mirror into the job environment for the steps that do not read .env
+          # (prisma, next build). Heredoc form because the key ring value is JSON.
+          {
+            echo "FIELD_ENCRYPTION_KEYS<<__EOF__"
+            echo "{\"ci1\":\"${FIELD_KEY}\"}"
+            echo "__EOF__"
+            echo "FIELD_ENCRYPTION_ACTIVE_KEY_ID=ci1"
+            echo "SSN_BLIND_INDEX_KEY=${BLIND_KEY}"
+            echo "CSRF_SECRET=${CSRF}"
+            echo "HANDOFF_TOKEN_SECRET=${HANDOFF}"
+          } >> "$GITHUB_ENV"
+          # Never print the values; prove only that the file has the expected shape.
+          echo "wrote .env with $(wc -l < .env) variables"
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      # NFR-026: "versioned and repeatable" migrations; a fresh environment reaches a
+      # working state from zero. This is that claim, executed against an empty database
+      # on every run. `npm run db:setup` is exactly these two commands; they are split
+      # here so a migration failure and a seed failure are distinguishable in the log.
+      - name: Apply migrations (real PostgreSQL, from empty)
+        run: npx prisma migrate deploy
+
+      - name: Seed (base config + §4.6.12 demonstration dataset under DEMO_MODE)
+        run: npx prisma db seed
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # -----------------------------------------------------------------------
+      # playwright.config.ts deliberately has NO `webServer` block — the suite
+      # assumes an externally managed instance on :3083. So CI is that external
+      # manager: start the production server, wait for /api/health to report the
+      # database AND storage checks green, and leave it up for BOTH suites.
+      #
+      # NODE_V8_COVERAGE: see the coverage note on the task-046 step below. V8
+      # writes the profile on clean exit only, which is why the shutdown step
+      # sends SIGINT and waits rather than killing the process.
+      # -----------------------------------------------------------------------
+      - name: Start the application
+        run: |
+          mkdir -p coverage/server-v8
+          NODE_V8_COVERAGE=coverage/server-v8 npm run start > server.log 2>&1 &
+          echo $! > .ci-server-pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3083/api/health | grep -q '"status":"ok"'; then
+              echo "server healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::server did not become healthy on :3083"
+          tail -100 server.log
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # NFR-028 unit/integration + "coverage report".
+      #
+      # `npm run test:coverage` is `npm test` plus Node's built-in
+      # --experimental-test-coverage, emitting the human-readable table to the log
+      # and coverage/lcov.info for the artifact. No coverage package is added: the
+      # delivered dependency tree is frozen.
+      #
+      # WHAT THIS COVERAGE NUMBER MEASURES — read before trusting it. task-046 is a
+      # BLACK-BOX suite: every assertion goes over HTTP to the server started above,
+      # and no suite imports from src/. So the in-process report covers the test
+      # harness (task-046/helpers/*.ts), NOT the application. The application's own
+      # execution happens in the server process, and that is what NODE_V8_COVERAGE
+      # captures into coverage/server-v8. That raw V8 profile is the source of the
+      # REAL src/ number: the "Render src/ coverage" step below converts it to
+      # coverage/src-lcov.info with scripts/coverage-report.mjs (dependency-free —
+      # the delivery stays frozen), scoped to src/. See docs/coverage.md. Both the
+      # harness lcov and the rendered src/ lcov are published; neither is dressed up
+      # as the other.
+      # -----------------------------------------------------------------------
+      - name: "task-046 — unit/integration suite with coverage (§7.7)"
+        run: npm run test:coverage
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # -----------------------------------------------------------------------
+      # NFR-028 end-to-end. Runs AFTER task-046 by design: 00-auth.setup.ts re-runs
+      # the §4.6.12 demonstration seed, so the journeys start from a known dataset
+      # regardless of the rows task-046 left behind. The reverse order would not be
+      # safe — task-046 has no equivalent reset.
+      #
+      # Serial, zero retries, no `webServer` — all three are decisions made in
+      # playwright.config.ts, not here.
+      # -----------------------------------------------------------------------
+      - name: "task-047 — end-to-end browser journeys (§7.7)"
+        run: npm run test:e2e
+
+      # Graceful stop so V8 flushes the server coverage profile. `|| true` because a
+      # server that already exited must not turn a green suite red.
+      - name: Stop the application (graceful — flushes server coverage)
+        if: always()
+        run: |
+          if [ -f .ci-server-pid ]; then
+            kill -INT "$(cat .ci-server-pid)" 2>/dev/null || true
+            for i in $(seq 1 30); do
+              kill -0 "$(cat .ci-server-pid)" 2>/dev/null || break
+              sleep 1
+            done
+          fi
+          true
+
+      # -----------------------------------------------------------------------
+      # Render the REAL src/ coverage number from the server-side V8 profile.
+      # Runs AFTER the graceful stop above so V8 has flushed coverage/server-v8,
+      # and `if: always()` so the number is produced even when a suite failed.
+      # scripts/coverage-report.mjs remaps the V8 byte-range profile through the
+      # tsx/Next source maps to original src/ lines — dependency-free — and emits
+      # coverage/src-lcov.info plus a printed line/function summary in the log.
+      # This is what makes NFR-028's "coverage report" an application number, not
+      # a harness number. See docs/coverage.md.
+      # -----------------------------------------------------------------------
+      - name: Render src/ coverage (server-side V8 -> lcov)
+        if: always()
+        run: npm run coverage:src
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          # coverage/src-lcov.info    — REAL application (src/) coverage, rendered
+          #                             from the server-side V8 profile (see docs/coverage.md)
+          # coverage/lcov.info        — task-046 harness coverage (node:test, real report)
+          # coverage/server-v8/*.json — raw V8 profile of the application server
+          path: coverage/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          # Traces and screenshots are retain-on-failure / only-on-failure, so this
+          # is usually just results.json on a green run.
+          path: |
+            task-047/results.json
+            task-047/artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: server.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # NFR-019 / SEC-18: "dependency scan with no critical/high findings at delivery."
+  # Deliberately a SEPARATE job: a new advisory published against a pinned transitive
+  # dependency is real news, but it is not a reason to report the §7.7 suite as
+  # failing. Keeping them apart means the two signals stay readable.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: "Dependency audit (NFR-019)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: npm audit (high and critical)
+        run: npm run audit:ci
