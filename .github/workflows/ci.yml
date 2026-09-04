@@ -1,24 +1,27 @@
-# MortMortgage — CI (§7.7 Testing, NFR-028)
+# MortMortgage — CI (§7.7 Testing, NFR-028) — PUBLIC-REPOSITORY SCOPE
 #
-# NFR-028 requires four things. This workflow is where each one is enforced:
+# NFR-028 requires four things. Three are enforced here; one cannot run in this
+# repository, and the reason is worth reading:
 #
-#   1. "unit/integration tests (real PostgreSQL in CI)"  -> the `postgres:16-alpine`
-#      SERVICE CONTAINER below plus the `task-046` step. Nothing is mocked at the
-#      database boundary; the suite talks to a real server talking to real Postgres.
+#   1. "unit/integration tests (real PostgreSQL in CI)"  -> runs in the ENGAGEMENT
+#      repository only. The task-046 suite enumerates its route lists, transition
+#      matrices, and masking rules from contracts.json — the engagement contract,
+#      which ships to clients and is deliberately not present in this public
+#      repository. The suite files are included for reading; without the contract
+#      they exit immediately (that is the point: no hand-maintained endpoint lists).
+#      Result of record at delivery: 368/368.
 #   2. "end-to-end browser tests per named role journeys plus public tools"
-#      -> the `task-047` Playwright step (real Chromium).
+#      -> the `task-047` Playwright step (real Chromium) — runs here in full,
+#      against a real server talking to the real `postgres:16-alpine` SERVICE
+#      CONTAINER below. Nothing is mocked at the database boundary.
 #   3. "CI runs on every change with coverage report"    -> `on: [push, pull_request]`
-#      plus the `npm run test:coverage` step and the uploaded `coverage/` artifact.
+#      plus the server-side V8 coverage render and the uploaded `coverage/` artifact.
 #   4. "suite passes clean with zero external keys"      -> the env block below.
 #      Every value is either a non-secret flag or a THROWAWAY key generated in-run.
 #      There is not one `secrets.*` reference in this file, and there must never be:
 #      all five integrations (credit, AVM, income, pricing/AUS, OCR, address, bank
 #      link, email, SMS) run in their contracted simulation mode, which is what the
 #      absence of provider credentials selects.
-#
-# Honest scope note: this file is the CI descriptor. Its steps are the same commands
-# that are run locally against the same Postgres image; but a GitHub Actions run of
-# this workflow has NOT been executed as part of the change that introduced it.
 
 name: CI
 
@@ -33,15 +36,13 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The §7.7 suite: typecheck -> migrate -> seed -> build -> serve -> task-046
-  # (unit/integration, with coverage) -> task-047 (end-to-end browser).
-  #
-  # One job, not two, on purpose: both suites drive the SAME running application
-  # instance over HTTP, exactly as they do locally. Splitting them would mean
-  # standing the stack up twice and would still not let them share a server.
+  # The §7.7 suite, public scope: typecheck -> migrate (from empty) -> seed ->
+  # build -> serve -> task-047 (end-to-end browser) -> server-side coverage.
+  # task-046 is contract-driven and runs in the engagement repository (see the
+  # header note).
   # ---------------------------------------------------------------------------
   test:
-    name: "§7.7 suite (real PostgreSQL, coverage)"
+    name: "§7.7 suite (public scope: E2E, real PostgreSQL)"
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -189,37 +190,14 @@ jobs:
           tail -100 server.log
           exit 1
 
-      # -----------------------------------------------------------------------
-      # NFR-028 unit/integration + "coverage report".
-      #
-      # `npm run test:coverage` is `npm test` plus Node's built-in
-      # --experimental-test-coverage, emitting the human-readable table to the log
-      # and coverage/lcov.info for the artifact. No coverage package is added: the
-      # delivered dependency tree is frozen.
-      #
-      # WHAT THIS COVERAGE NUMBER MEASURES — read before trusting it. task-046 is a
-      # BLACK-BOX suite: every assertion goes over HTTP to the server started above,
-      # and no suite imports from src/. So the in-process report covers the test
-      # harness (task-046/helpers/*.ts), NOT the application. The application's own
-      # execution happens in the server process, and that is what NODE_V8_COVERAGE
-      # captures into coverage/server-v8. That raw V8 profile is the source of the
-      # REAL src/ number: the "Render src/ coverage" step below converts it to
-      # coverage/src-lcov.info with scripts/coverage-report.mjs (dependency-free —
-      # the delivery stays frozen), scoped to src/. See docs/coverage.md. Both the
-      # harness lcov and the rendered src/ lcov are published; neither is dressed up
-      # as the other.
-      # -----------------------------------------------------------------------
-      - name: "task-046 — unit/integration suite with coverage (§7.7)"
-        run: npm run test:coverage
+      # (task-046 would run here in the engagement repository — see header note.)
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
       # -----------------------------------------------------------------------
-      # NFR-028 end-to-end. Runs AFTER task-046 by design: 00-auth.setup.ts re-runs
-      # the §4.6.12 demonstration seed, so the journeys start from a known dataset
-      # regardless of the rows task-046 left behind. The reverse order would not be
-      # safe — task-046 has no equivalent reset.
+      # NFR-028 end-to-end. 00-auth.setup.ts re-runs the §4.6.12 demonstration
+      # seed, so the journeys start from a known dataset.
       #
       # Serial, zero retries, no `webServer` — all three are decisions made in
       # playwright.config.ts, not here.
@@ -260,9 +238,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage
-          # coverage/src-lcov.info    — REAL application (src/) coverage, rendered
-          #                             from the server-side V8 profile (see docs/coverage.md)
-          # coverage/lcov.info        — task-046 harness coverage (node:test, real report)
+          # coverage/src-lcov.info    — application (src/) coverage exercised by the
+          #                             E2E journeys, rendered from the server-side
+          #                             V8 profile (see docs/coverage.md)
           # coverage/server-v8/*.json — raw V8 profile of the application server
           path: coverage/
           if-no-files-found: warn

@@ -41,6 +41,8 @@ Every fix landed as a contract change with finding IDs — not a hand-patch.
 
 Code comments here cite identifiers like `REQ-062`, `INV-048`, `XBR-014`, and sections of a build plan and contract. Those documents exist — a ~945-field contract at revision 23, a build plan, an assessment, a verification tree of over 1,000 evidence files, and the full adversarial-review, exercise, and quality-gate reports. They are **withheld by design, not missing by accident**: the methodology that produces them is BrightMeld's product, and the complete artifact set is what a client receives with their engagement. We show it live. The identifiers are left in the code because traceability from any line back to its requirement is the point.
 
+The withholding has one visible consequence: the unit/integration suite (`task-046/`) enumerates its route lists, transition matrices, and masking rules from `contracts.json` rather than from hand-maintained arrays — so in this repository it exits immediately, and CI here runs the full stack (migrate from empty, seed, build, serve) plus the 87-test end-to-end suite instead. The contract-driven suite's result of record at delivery: 368/368. It has since grown to 465/465 through three post-delivery contract-governed changes.
+
 ## Running it
 
 Full instructions: [`task-048/README.md`](./task-048/README.md) (the delivered system documentation).
@@ -60,6 +62,10 @@ Or the full stack with Docker Compose (PostgreSQL + S3 emulator): `docker compos
 ## Documentation
 
 The delivered documentation set is in [`task-048/`](./task-048/): user guide, deployment runbook (AWS + Docker), IdP wiring, the complete URLA→MISMO field mapping (167 entries), HMDA code tables, simulation mappings, and 12+ executable demo walkthroughs.
+
+## License
+
+Source-available for evaluation and reading. All rights reserved — this is a showcase of a delivered engagement, not an open-source product.
 
 ---
 
