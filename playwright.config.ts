@@ -47,7 +47,9 @@ export default defineConfig({
     },
     {
       name: "journeys",
-      testIgnore: /.*\.setup\.ts/,
+      // 11-production-mode is CH-024's `next start` spec; it runs under its own
+      // config (playwright.production.config.ts) against port 3084, not here.
+      testIgnore: [/.*\.setup\.ts/, /11-production-mode\.spec\.ts/],
       dependencies: ["setup"],
       use: { ...devices["Desktop Chrome"], viewport: { width: 1400, height: 1100 } },
     },

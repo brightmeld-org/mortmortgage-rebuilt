@@ -132,6 +132,14 @@ test("registration, verification and MFA enrollment complete with the keyboard a
   await keyboardFill(page, "signup-password-confirmation", SUITE_PASSWORD);
   await keyboardCheck(page, "signup-accept-terms");
   await keyboardActivate(page, "signup-submit");
+  // Wait for the registration acknowledgement before reading the outbound log:
+  // the (argon2-slow) registration commits the verification email inside its
+  // transaction, and the outbound view fetches once on open without live refresh —
+  // reading before the ack races ahead of the row's commit.
+  await expect(
+    page.getByTestId("signup-success"),
+    "keyboard registration never produced the acknowledgement",
+  ).toBeVisible({ timeout: 120_000 });
 
   // Read the verification link from the simulated outbound log in a separate session.
   const supervisorContext = await browser.newContext({ storageState: storagePath("supervisor") });

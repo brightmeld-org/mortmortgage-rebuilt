@@ -77,23 +77,27 @@ transitive imports). The rendering path works.
 
 **NOT proven — documented delivery limitations, not closed items:**
 
-1. **CI has never executed.** The build is **untracked in the engagement repo**
-   (`git ls-files` returns a single file — the RFP), so
-   `.github/workflows/ci.yml` has never been pushed and GitHub Actions has never
-   run this workflow. Every claim that the suite "passes in CI with a coverage
-   report" (task-046 AC-5, task-047 AC-4) is therefore **unverified by
-   execution**. The workflow is a correct descriptor of the same commands run
-   locally against the same Postgres image, but a green CI run does not exist and
-   cannot be produced from this machine. This can only be closed by committing
-   the build to the engagement repo and letting Actions run.
+1. **CI now executes (public repo), and the `src/` coverage number is still not
+   produced by it.** UPDATE 2026-09-06: the build was published to the public
+   `brightmeld-org/mortmortgage-rebuilt` repo and GitHub Actions now runs this
+   workflow on every push. The §7.7 e2e suite passes there (87/87). The
+   server-side V8 profile is now captured (the stop step flushes it via a
+   process-group SIGINT to a directly-started `next start`). **But the coverage
+   *render* still produces no `src/` number**, because a production `next build`
+   emits no server source maps: the profile has 1000+ scripts with zero source
+   maps to remap through (`scripts considered: N, with src map: 0`). The
+   render step is therefore **non-blocking** (`continue-on-error`) — it runs and
+   prints this finding but does not gate the suite. Closing it requires emitting
+   server source maps in the production build, a separate build-config decision
+   (weighed against build size and source exposure) — not yet taken.
 
-2. **The full `src/` coverage percentage is not yet a measured number.** The
-   percentage requires the server-side profile captured during a *complete*
-   §7.7 + e2e run (task-046 + task-047 against the running app) — i.e. the CI
-   job above, or a full local run. The proof above establishes the *mechanism*
-   on a small captured profile; it is not the whole-application number and is
-   not presented as one.
+2. **The full `src/` coverage percentage is not yet a measured number.** As
+   above: even with a complete §7.7 + e2e run against the running app, the
+   production build's lack of server source maps means the render yields no
+   whole-application figure. The proof earlier in this doc establishes the
+   *mechanism* on a small maps-bearing profile; the whole-app number awaits a
+   maps-emitting production build.
 
-In short: the coverage *configuration* is now capable and honest; the coverage
-*number* and the CI *execution* remain to be produced by a real run that this
-machine cannot perform.
+In short: CI execution is now real and the suite is green; the coverage
+*number* remains unproduced, blocked on server source maps in the production
+build, and its render step is explicitly non-blocking until that decision.
