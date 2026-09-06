@@ -151,7 +151,13 @@ test("auto-assigns the remaining unassigned set", async ({ page }) => {
   const before = await page.locator('[data-testid^="assign-btn-"]').count();
   expect(before, "there is unassigned work for auto-assign to place").toBeGreaterThan(0);
 
+  // Opens the confirmation dialog; the POST fires only from its confirm button.
   await page.getByTestId("auto-assign-btn").click();
+  await expect(page.getByTestId("auto-confirm-btn")).toBeVisible({ timeout: 120_000 });
+  await page.getByTestId("auto-confirm-btn").click();
+  // The dialog switches to its per-application results view once placement completes.
+  await expect(page.getByTestId("auto-close-btn")).toBeVisible({ timeout: 300_000 });
+  await page.getByTestId("auto-close-btn").click();
 
   // Auto-assign places the unassigned set; re-reading the filtered list shows fewer
   // applications still offering an Assign action.
