@@ -113,6 +113,11 @@ async function runCheck(page: Page, checkType: "credit" | "income" | "avm" | "pr
     const retry = page.getByTestId(`check-retry-${checkType}`);
     if (!(await retry.isVisible().catch(() => false))) break;
     await awaitHydrated(page, `check-retry-${checkType}`);
+    // Retry is disabled while an attempt is in flight; on a slow CI runner that
+    // window can outlast the default action timeout, so the click would fail
+    // waiting on an enabled button. Wait for it to settle to enabled first, on
+    // the same budget as the check simulation itself.
+    await expect(retry).toBeEnabled({ timeout: 300_000 });
     await retry.click();
   }
   if (!(await badge.isVisible().catch(() => false))) {

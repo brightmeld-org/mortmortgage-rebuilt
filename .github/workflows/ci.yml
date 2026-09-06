@@ -178,7 +178,14 @@ jobs:
       - name: Start the application
         run: |
           mkdir -p coverage/server-v8
-          NODE_V8_COVERAGE=coverage/server-v8 npm run start > server.log 2>&1 &
+          # Start Next DIRECTLY (not via `npm run start`) and as a process-group
+          # leader (setsid), so (a) the recorded PID is the node process that holds
+          # the V8 coverage profile, and (b) a group-directed SIGINT in the stop step
+          # reaches the server itself. Routing through npm meant the SIGINT hit npm,
+          # which did not forward it in a way that let the server exit cleanly, so V8
+          # never flushed coverage/server-v8/*.json and `coverage:src` found nothing
+          # (CI-only failure of record — worked on the delivery machine).
+          setsid env NODE_V8_COVERAGE=coverage/server-v8 node_modules/.bin/next start -p 3083 > server.log 2>&1 &
           echo $! > .ci-server-pid
           for i in $(seq 1 60); do
             if curl -fsS http://localhost:3083/api/health | grep -q '"status":"ok"'; then
@@ -211,11 +218,22 @@ jobs:
         if: always()
         run: |
           if [ -f .ci-server-pid ]; then
-            kill -INT "$(cat .ci-server-pid)" 2>/dev/null || true
+            pid="$(cat .ci-server-pid)"
+            # Negative PID → signal the whole process group (setsid made the server its
+            # leader), so the server and any child exit cleanly and V8 flushes. Fall back
+            # to the bare PID if the group send is refused.
+            kill -INT -"$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
             for i in $(seq 1 30); do
-              kill -0 "$(cat .ci-server-pid)" 2>/dev/null || break
+              kill -0 "$pid" 2>/dev/null || break
               sleep 1
             done
+          fi
+          # Surface a missing profile here (loudly) instead of letting the downstream
+          # coverage-render step fail with a cryptic "no coverage-*.json".
+          if ls coverage/server-v8/coverage-*.json >/dev/null 2>&1; then
+            echo "V8 coverage profile flushed"
+          else
+            echo "::warning::no V8 coverage profile after graceful stop"
           fi
           true
 
