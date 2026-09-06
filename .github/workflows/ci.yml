@@ -190,6 +190,27 @@ jobs:
           tail -100 server.log
           exit 1
 
+      # -----------------------------------------------------------------------
+      # The delivered system is TWO processes (DEPLOYMENT.md §4): the web app and
+      # the background-job worker (auto-assignment, notification delivery,
+      # document jobs). The §7.7 journeys assert worker-owned outcomes, so CI
+      # must run the worker exactly as a deployment would — without it, the
+      # auto-assign and outbound-delivery journeys wait on state that can never
+      # change. No health endpoint exists for the worker; a liveness check after
+      # startup is the best available signal.
+      # -----------------------------------------------------------------------
+      - name: Start the worker
+        run: |
+          npm run worker > worker.log 2>&1 &
+          echo $! > .ci-worker-pid
+          sleep 5
+          if ! kill -0 "$(cat .ci-worker-pid)" 2>/dev/null; then
+            echo "::error::worker exited immediately after start"
+            tail -100 worker.log
+            exit 1
+          fi
+          echo "worker running (pid $(cat .ci-worker-pid))"
+
       # (task-046 would run here in the engagement repository — see header note.)
 
       - name: Install Playwright Chromium
@@ -210,13 +231,15 @@ jobs:
       - name: Stop the application (graceful — flushes server coverage)
         if: always()
         run: |
-          if [ -f .ci-server-pid ]; then
-            kill -INT "$(cat .ci-server-pid)" 2>/dev/null || true
-            for i in $(seq 1 30); do
-              kill -0 "$(cat .ci-server-pid)" 2>/dev/null || break
-              sleep 1
-            done
-          fi
+          for pidfile in .ci-worker-pid .ci-server-pid; do
+            if [ -f "$pidfile" ]; then
+              kill -INT "$(cat "$pidfile")" 2>/dev/null || true
+              for i in $(seq 1 30); do
+                kill -0 "$(cat "$pidfile")" 2>/dev/null || break
+                sleep 1
+              done
+            fi
+          done
           true
 
       # -----------------------------------------------------------------------
@@ -264,7 +287,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: server-log
-          path: server.log
+          path: |
+            server.log
+            worker.log
           if-no-files-found: warn
           retention-days: 14
 
