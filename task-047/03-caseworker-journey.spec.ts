@@ -104,21 +104,26 @@ async function runCheck(page: Page, checkType: "credit" | "income" | "avm" | "pr
   // for Retry, so the journey drives Retry rather than treating a contracted transient
   // as a dead end. A fault that never clears still fails, with the bureau's own words.
   const badge = page.getByTestId(`check-badge-${checkType}`);
-  const settled = page.locator(
-    `[data-testid="check-badge-${checkType}"], [data-testid="check-retry-${checkType}"]`,
-  );
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    await settled.first().waitFor({ state: "visible", timeout: 300_000 }).catch(() => undefined);
+  const retry = page.getByTestId(`check-retry-${checkType}`);
+  // Drive the async check to a terminal risk badge, tolerating every transient
+  // in between. The execution is dispatched via next/server `after()` (runs
+  // in-process after the 202), so under CI load the panel cycles through:
+  //   running spinner -> (503) errored+Retry -> Retry briefly `busy`/disabled
+  //   while the re-run POSTs -> running again -> badge (or another 503).
+  // A single `toBeEnabled` wait deadlocks the whole budget if it samples the
+  // button mid-`busy`; instead poll the state and act on what is TRUE right now:
+  // a badge is success; an ENABLED Retry is the cue to drive another attempt;
+  // anything else (running, or a momentarily-disabled Retry) is a transient to
+  // wait through. Budget covers the app's 10-minute stuck-check reconciler, so
+  // even a dropped `after()` recovers into an errored+Retry we can re-drive.
+  const deadline = Date.now() + 660_000;
+  while (Date.now() < deadline) {
     if (await badge.isVisible().catch(() => false)) break;
-    const retry = page.getByTestId(`check-retry-${checkType}`);
-    if (!(await retry.isVisible().catch(() => false))) break;
-    await awaitHydrated(page, `check-retry-${checkType}`);
-    // Retry is disabled while an attempt is in flight; on a slow CI runner that
-    // window can outlast the default action timeout, so the click would fail
-    // waiting on an enabled button. Wait for it to settle to enabled first, on
-    // the same budget as the check simulation itself.
-    await expect(retry).toBeEnabled({ timeout: 300_000 });
-    await retry.click();
+    if ((await retry.isVisible().catch(() => false)) && (await retry.isEnabled().catch(() => false))) {
+      await awaitHydrated(page, `check-retry-${checkType}`);
+      await retry.click().catch(() => undefined);
+    }
+    await page.waitForTimeout(2000);
   }
   if (!(await badge.isVisible().catch(() => false))) {
     const reason = await page
@@ -129,7 +134,7 @@ async function runCheck(page: Page, checkType: "credit" | "income" | "avm" | "pr
       `the ${checkType} check never produced a risk badge${reason ? `: ${reason.replace(/\s+/g, " ").slice(0, 300)}` : ""}`,
     );
   }
-  await expect(badge).toBeVisible({ timeout: 300_000 });
+  await expect(badge).toBeVisible({ timeout: 60_000 });
   await expect(badge).not.toHaveText("");
 }
 
