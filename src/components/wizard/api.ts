@@ -9,6 +9,7 @@ import type {
   AddressSuggestion,
   Application,
   BankLinkSession,
+  BankLinkTokenResponse,
   BorrowerApplicationRow,
   BorrowerIdentityOwn,
   AppDocument,
@@ -322,6 +323,61 @@ export function postBankLinkImport(id: string, linkId: string, csrfToken: string
  */
 export function deleteBankLink(id: string, linkId: string, csrfToken: string) {
   return sendJson<Application>("DELETE", `/api/applications/${id}/bank-links/${linkId}`, csrfToken);
+}
+
+// ---------------------------------------------------------------------------
+// Bank linking — token flow (CH-025, INV-054; real mode only)
+// ---------------------------------------------------------------------------
+
+/** CH-025 (INV-054): the server-exposed bank-mode flag — mirrors
+ *  BANK_MODE_COOKIE in src/middleware.ts. Set to "real" iff BANK_PROVIDER=real;
+ *  absent under simulation, so the delivered default reads "simulation". */
+const BANK_MODE_COOKIE = "mm_bank_mode";
+
+/**
+ * Read the bank-provider mode the server exposed (never key material). The
+ * borrower bank-link UI renders the Link-widget flow only when this reports
+ * "real"; under simulation the existing institution-picker + credentials form
+ * renders unchanged (INV-054).
+ */
+export function readBankLinkMode(): "simulation" | "real" {
+  if (typeof document === "undefined") return "simulation";
+  const entry = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${BANK_MODE_COOKIE}=`));
+  return entry?.slice(BANK_MODE_COOKIE.length + 1) === "real" ? "real" : "simulation";
+}
+
+/**
+ * POST /api/applications/:id/bank-links/link-token — the short-lived Link
+ * token for the client widget (real mode; 503 not-available under simulation,
+ * retryable 503 while the real adapter is unwired — surfaced with Retry).
+ */
+export function postBankLinkToken(id: string, csrfToken: string) {
+  return sendJson<BankLinkTokenResponse>(
+    "POST",
+    `/api/applications/${id}/bank-links/link-token`,
+    csrfToken,
+  );
+}
+
+/**
+ * POST /api/applications/:id/bank-links/exchange — exchange the widget's
+ * public token; returns the SAME BankLinkSession shape as the credentials flow
+ * (INV-054), so the account-selection + import surface is shared unchanged.
+ */
+export function postBankLinkExchange(
+  id: string,
+  csrfToken: string,
+  body: { publicToken: string; institutionId?: string; institutionName?: string },
+) {
+  return sendJson<BankLinkSession>(
+    "POST",
+    `/api/applications/${id}/bank-links/exchange`,
+    csrfToken,
+    body,
+  );
 }
 
 // ---------------------------------------------------------------------------

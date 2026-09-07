@@ -7,9 +7,16 @@
 // silently to empty suggestions (manual entry, §4.2.11). Stateless — no user
 // data, no record-level scoping, no audit (§D: no XBR owns address).
 
+// CH-025 (INV-051/INV-052): suggestions now flow through the
+// AddressSuggestProvider seam — ADDRESS_PROVIDER=simulation (default) is the
+// delivered dataset simulation, byte-identical; =real is the Layer-B slot
+// (fail-soft [] until hand-completed). Any provider fault degrades silently to
+// an empty list in both modes. The deterministic geocoder is NOT behind this
+// seam (INV-052).
+
 import { logged } from "@/lib/log";
 import { guard } from "@/lib/guard";
-import { suggestAddresses, type AddressSuggestion } from "@/lib/services/geocoding";
+import { suggestAddressesViaProvider, type AddressSuggestion } from "@/lib/services/address";
 
 /** contracts §A AddressSuggestResponse. */
 interface AddressSuggestResponse {
@@ -21,7 +28,7 @@ async function GET_impl(request: Request): Promise<Response> {
   if (!guarded.ok) return guarded.response;
 
   const q = new URL(request.url).searchParams.get("q");
-  const suggestions = await suggestAddresses(q);
+  const suggestions = await suggestAddressesViaProvider(q);
   const body: AddressSuggestResponse = { suggestions };
   return Response.json(body);
 }

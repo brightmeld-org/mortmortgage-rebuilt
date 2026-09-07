@@ -85,6 +85,19 @@ services:
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_FORCE_PATH_STYLE: "true"
+      # CH-025 (INT-023): real-provider seam selectors — defaults are the
+      # zero-key simulations; a keyed deployment sets the selector plus its
+      # keys in the untracked .env (names in .env.example; values never here).
+      OCR_PROVIDER: ${OCR_PROVIDER:-simulation}
+      OCR_PROVIDER_KIND: ${OCR_PROVIDER_KIND:-http}
+      OCR_PROVIDER_BASE_URL: ${OCR_PROVIDER_BASE_URL:-}
+      OCR_PROVIDER_API_KEY: ${OCR_PROVIDER_API_KEY:-}
+      ADDRESS_PROVIDER: ${ADDRESS_PROVIDER:-simulation}
+      GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
+      BANK_PROVIDER: ${BANK_PROVIDER:-simulation}
+      PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
+      PLAID_SECRET: ${PLAID_SECRET:-}
+      PLAID_ENV: ${PLAID_ENV:-}
       # Secrets — required, interpolated from the untracked .env (never committed).
       FIELD_ENCRYPTION_KEYS: ${FIELD_ENCRYPTION_KEYS:?set in .env — see .env.example}
       FIELD_ENCRYPTION_ACTIVE_KEY_ID: ${FIELD_ENCRYPTION_ACTIVE_KEY_ID:?set in .env — see .env.example}

@@ -35,6 +35,15 @@ export interface OcrExtractionRequest {
   referenceDate: Date;
   /** The application's ENTERED data slice (§6.3.7 derived values). */
   entered: OcrEnteredData;
+  /**
+   * ADDITIVE (CH-025 Layer B): lazy accessor for the stored document bytes,
+   * populated by the caller (document-ocr.ts) from the storage adapter. A
+   * REAL vision backend needs the content the simulation derives without;
+   * the simulation ignores this field entirely, so default behavior is
+   * unchanged. Optional: absent (older callers, evidence drives) → a real
+   * backend fail-softs retryable.
+   */
+  loadContent?: () => Promise<{ bytes: Uint8Array; mimeType: string } | null>;
 }
 
 export type OcrOutcome =

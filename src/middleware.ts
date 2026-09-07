@@ -33,13 +33,34 @@ function generateNonce(): string {
   return btoa(binary);
 }
 
-function buildCsp(nonce: string): string {
+/**
+ * CH-025 (INV-053): the ONLY branch input for the conditional CSP is the bank
+ * provider mode. Edge-safe local read (this file cannot import the Node seam
+ * module src/lib/services/bank/index.ts — its fail-fast validation belongs to
+ * the Node boot path, not the edge). Strictly `=== "real"` — the biconditional:
+ * any other value (including unset and invalid) keeps the delivered default.
+ */
+function isBankProviderReal(env: Record<string, string | undefined>): boolean {
+  return (env.BANK_PROVIDER ?? "").trim().toLowerCase() === "real";
+}
+
+export function buildCsp(
+  nonce: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
   // SEC-17: NO 'unsafe-inline' scripts — framework inline scripts receive the
   // per-request nonce ('strict-dynamic' lets nonced scripts load their chunks).
   // Development only: 'unsafe-eval' is required by Next.js HMR/react-refresh;
   // SEC-17 governs the production posture, where it is never emitted.
-  const isDev = process.env.NODE_ENV === "development";
-  const scriptSrc = `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}`;
+  const isDev = env.NODE_ENV === "development";
+  // CH-025 (INV-053): the bank aggregator Link widget (script + iframe from
+  // https://cdn.plaid.com) is admitted in script-src AND frame-src when and
+  // only when BANK_PROVIDER=real. Under simulation (including unset) the
+  // emitted CSP is byte-identical to the delivered default — no frame-src
+  // directive existed there (default-src 'self' governs frames), and none is
+  // emitted. Nonce + strict-dynamic are unchanged in both modes.
+  const bankReal = isBankProviderReal(env);
+  const scriptSrc = `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}${bankReal ? " https://cdn.plaid.com" : ""}`;
   return [
     "default-src 'self'",
     scriptSrc,
@@ -55,6 +76,7 @@ function buildCsp(nonce: string): string {
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
+    ...(bankReal ? ["frame-src 'self' https://cdn.plaid.com"] : []),
     "frame-ancestors 'none'",
   ].join("; ");
 }
@@ -90,6 +112,11 @@ function applySecurityHeaders(headers: Headers, csp: string): void {
 /** Session cookie name — mirrors SESSION_COOKIE_NAME in src/lib/auth.ts (that
  * module cannot be imported here: it would pull Prisma into the edge bundle). */
 const SESSION_COOKIE = "mm_session";
+
+/** CH-025 (INV-054): the server-exposed bank-provider mode flag — set to
+ * "real" iff BANK_PROVIDER=real; absent under simulation. Mirrors
+ * BANK_MODE_COOKIE in src/components/wizard/api.ts (same no-import rule). */
+const BANK_MODE_COOKIE = "mm_bank_mode";
 
 /** Authenticated-page prefixes per the requirements §8 route inventory. */
 const PROTECTED_PAGE_PREFIXES = [
@@ -201,6 +228,23 @@ export function middleware(request: NextRequest): NextResponse {
   const response = NextResponse.next({ request: { headers: requestHeaders } });
   applySecurityHeaders(response.headers, csp);
   response.headers.set("x-request-id", requestId);
+
+  // CH-025 (INV-054): the server-exposed bank-mode flag for the borrower
+  // bank-link UI — a bare mode word, never key material. Only real mode sets
+  // the cookie; under simulation it is deleted ONLY when a stale copy is
+  // present (a switched-back deployment), so the delivered zero-key posture's
+  // responses stay byte-identical — no Set-Cookie header is ever emitted in
+  // the default configuration.
+  if (isBankProviderReal(process.env)) {
+    response.cookies.set(BANK_MODE_COOKIE, "real", {
+      path: "/",
+      sameSite: "lax",
+      httpOnly: false, // read by the wizard client to gate the Link-widget flow
+    });
+  } else if (request.cookies.has(BANK_MODE_COOKIE)) {
+    response.cookies.delete(BANK_MODE_COOKIE);
+  }
+
   return response;
 }
 
