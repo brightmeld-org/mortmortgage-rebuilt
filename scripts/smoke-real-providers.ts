@@ -77,7 +77,7 @@ async function smokeOcr(): Promise<void> {
   const bytes = readFileSync(pdfPath);
   const form = new FormData();
   form.set("file", new File([new Uint8Array(bytes)], "smoke-paystub.pdf", { type: "application/pdf" }));
-  form.set("documentType", "paystub");
+  form.set("documentType", "pay-stub");
   const upload = await POST<{ id?: string; documents?: Array<{ id: string }> }>(
     `/api/applications/${appId}/documents`,
     { session: borrower, form },
@@ -91,25 +91,26 @@ async function smokeOcr(): Promise<void> {
   if (!documentId) return record("ocr/upload", false, "no document id in response");
   record("ocr/upload", true, `document ${documentId} uploaded`);
 
-  const staff = await demoLogin("caseworker" as DemoRole);
+  // Supervisor, not caseworker: OCR reads are assignment-scoped for caseworkers
+  // (S-2), and the demo caseworker is not assigned this borrower's application.
+  const staff = await demoLogin("supervisor" as DemoRole);
   const deadline = Date.now() + 120_000;
   let last = "";
   while (Date.now() < deadline) {
     const ocr = await GET<{
-      jobStatus?: string;
-      provider?: string;
+      job?: { status?: string; provider?: string; attempt?: number } | null;
       extraction?: { provider?: string; fields?: Array<{ fieldPath: string; extractedValue: string }> } | null;
     }>(`/api/documents/${documentId}/ocr`, { session: staff });
     last = JSON.stringify(ocr.body).slice(0, 300);
-    const status = ocr.body.jobStatus ?? "";
+    const status = ocr.body.job?.status ?? "";
     if (status === "completed" && ocr.body.extraction) {
       const fields = ocr.body.extraction.fields ?? [];
       const gross = fields.find((f) => f.fieldPath === "paystub.grossPay");
       return record(
         "ocr/extraction",
         fields.length > 0,
-        `provider=${ocr.body.extraction.provider ?? ocr.body.provider} fields=${fields.length}` +
-          (gross ? ` grossPay="${gross.extractedValue}"` : " (no grossPay row)"),
+        `provider=${ocr.body.extraction.provider ?? ocr.body.job?.provider} attempt=${ocr.body.job?.attempt} fields=${fields.length}` +
+          (gross ? ` grossPay="${gross.extractedValue}"` : ""),
       );
     }
     if (status === "failed") return record("ocr/extraction", false, `job failed — ${last}`);

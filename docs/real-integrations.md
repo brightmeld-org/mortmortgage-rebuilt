@@ -81,31 +81,32 @@ Result: see §Smoke record below.
 
 ## Smoke record + key validity
 
-**2026-09-07 — smoke BLOCKED at the key-placement step, by permission control, not by code.**
-The autonomous session's permission layer refused every form of reading/copying the key file
-at `c:\Users\marce\Documents\Projects\MortMortgage\.env.local` (probe script, value-hidden
-rewrite, and plain byte-copy were all denied). Key validity is therefore **UNTESTED** in this
-session. Everything else is staged; the operator completes the smoke with:
+**2026-09-07 — operator-run smoke, all three integrations proven live** (production server on
+:3083, keys in gitignored `.env.local` copied from App A; the autonomous session's permission
+layer had blocked the key transfer, so the operator ran the placement + smoke by hand):
 
-```powershell
-# 1. Place keys (values never printed) — from the mortgage_v3 run dir:
-Copy-Item c:\Users\marce\Documents\Projects\MortMortgage\.env.local .env.local
-Add-Content .env.local "`nOCR_PROVIDER=real`nOCR_PROVIDER_KIND=claude`nOCR_PROVIDER_API_KEY=`$ANTHROPIC_API_KEY`nADDRESS_PROVIDER=real`nBANK_PROVIDER=real"
-# 2. Prod server with real providers:
-npm run build; npm run start   # port 3083
-# 3. Smoke (new shell):
-npx tsx --env-file=.env scripts/smoke-real-providers.ts all
-# 4. Widget flow: open the borrower bank-link dialog in the browser —
-#    Plaid Link should load (sandbox: user_good / pass_good / MFA 1234),
-#    exchange, import an account, then unlink (revokes the sandbox item).
-# 5. Remove .env.local afterwards to return the machine to keyless default.
-```
+- `address` — **PASS**: `GET /api/address/suggest?q=1600 Amphitheatre Parkway Mountain View`
+  → 1 suggestion, `"1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA"` (real Google data).
+- `bank/link-token` — **PASS**: `POST .../bank-links/link-token` → live Plaid sandbox link
+  token issued (4-hour expiry).
+- `ocr` — **PASS**: uploaded `scripts/smoke-paystub.pdf` as borrower →
+  `provider=claude-ocr-provider`, completed on **attempt 1 in ~10 s**, **9 fields**,
+  `paystub.grossPay="$4,250.00"` — the exact value printed in the PDF.
+- Plaid Link widget flow — **PASS** (operator browser pass, 2026-09-07): the widget loaded
+  from `cdn.plaid.com` under the real-mode CSP, the sandbox login (`user_good`/`pass_good`,
+  MFA `1234`) exchanged, accounts imported into Step 4, and unlink completed (best-effort
+  sandbox item revocation).
 
-| Key | Status |
+To reproduce: steps in this section's history (copy App A `.env.local` → append the five
+selector lines → `npm run build; npm run start` → `npx tsx --env-file=.env
+scripts/smoke-real-providers.ts all`). Remove `.env.local` afterwards to return to the
+keyless default.
+
+| Key | Status (2026-09-07) |
 |---|---|
-| `ANTHROPIC_API_KEY` (App A `.env.local`) | UNTESTED — key transfer blocked by session permission layer |
-| `GOOGLE_PLACES_API_KEY` | UNTESTED — same |
-| `PLAID_CLIENT_ID`/`PLAID_SECRET` (`PLAID_ENV` per App A) | UNTESTED — same |
+| `ANTHROPIC_API_KEY` (App A `.env.local`) | **VALID** — live Claude Vision extraction succeeded |
+| `GOOGLE_PLACES_API_KEY` | **VALID** — live autocomplete+details succeeded |
+| `PLAID_CLIENT_ID`/`PLAID_SECRET` (`PLAID_ENV=sandbox`) | **VALID** — live link-token issuance succeeded |
 
 ## Never do
 

@@ -45,7 +45,7 @@ const FIELD_PATHS: Record<string, string[]> = {
     "w2.federalTaxWithheld",
     "w2.taxYear",
   ],
-  paystub: [
+  "pay-stub": [
     "employment.employerName",
     "employment.baseMonthlyIncome",
     "paystub.payPeriodStart",
