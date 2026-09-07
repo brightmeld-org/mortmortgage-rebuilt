@@ -90,6 +90,19 @@ const EXCLUSIONS: Record<string, string> = {
     "REQ-070 read-state is per-user operational state on the recipient's own notification, not an application-domain event in the RFP's audited action set.",
   "POST /api/notifications/read-all":
     "REQ-070 bulk read-state — same ruling as the single-notification read.",
+
+  // CH-025 (INV-054): the two token-flow endpoints are mode-gated. Under the
+  // keyless simulation this suite runs in, both return the contracted 503
+  // not-available and persist nothing — no state change to audit. On a
+  // real-mode Layer-B success the exchange persists a BankLink through the
+  // same audited path as the credentials flow (`bank-link` action); link-token
+  // issuance mutates nothing in any mode (token issuance only, like
+  // handoff-token above). Suite 27 exercises both endpoints' 503/validation/
+  // role-gate behavior directly.
+  "POST /api/applications/:id/bank-links/link-token":
+    "CH-025/INV-054 token issuance persists no state in any mode; 503 not-available under the simulation this suite runs in.",
+  "POST /api/applications/:id/bank-links/exchange":
+    "CH-025/INV-054 503 not-available (no mutation) under simulation; the real-mode success path audits `bank-link` via the shared credentials-flow persistence path, unreachable keyless by design.",
 };
 
 interface Outcome {

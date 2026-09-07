@@ -7,14 +7,110 @@
 // POST import -> Application returned (asset rows source=bank-link). Income
 // evidence from the session surfaces in Step 3 (panel owned by the wizard root).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useModalFocus } from "@/components/a11y/use-modal-focus";
-import { getInstitutions, postBankLinkAuth, postBankLinkImport } from "./api";
+import {
+  getInstitutions,
+  postBankLinkAuth,
+  postBankLinkExchange,
+  postBankLinkImport,
+  postBankLinkToken,
+  readBankLinkMode,
+} from "./api";
 import type { Application, BankLinkSession, InstitutionInfo } from "./types";
 import { formatCurrencyDisplay } from "./format";
 import { inputClass } from "./fields";
 
-type Phase = "institutions" | "credentials" | "authenticating" | "accounts" | "importing" | "failed";
+type Phase =
+  | "institutions"
+  | "credentials"
+  | "authenticating"
+  | "accounts"
+  | "importing"
+  | "failed"
+  // CH-025 (INV-054) — real-mode Link-widget flow only:
+  | "widget-loading"
+  | "widget-ready"
+  | "widget-failed";
+
+/**
+ * CH-025 Layer B: launch the aggregator's Link widget (Plaid Link) with the
+ * issued token. The script loads from https://cdn.plaid.com — admitted by the
+ * real-mode CSP (INV-053), and dynamically-injected scripts inherit trust
+ * under 'strict-dynamic' since the injecting chunk is nonced. Any failure —
+ * script blocked/unreachable, widget error, user exit — lands in the
+ * retryable widget-failed state, mirroring the server seam's posture (never a
+ * crash). This code path is unreachable under simulation (mode-gated).
+ */
+const PLAID_LINK_SRC = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
+
+interface PlaidLinkHandle {
+  open: () => void;
+  exit: (opts?: { force?: boolean }) => void;
+}
+
+interface PlaidGlobal {
+  create: (config: {
+    token: string;
+    onSuccess: (publicToken: string, metadata: {
+      institution?: { institution_id?: string; name?: string } | null;
+    }) => void;
+    onExit: (err: { display_message?: string; error_message?: string } | null) => void;
+  }) => PlaidLinkHandle;
+}
+
+function loadPlaidScript(): Promise<PlaidGlobal> {
+  return new Promise((resolve, reject) => {
+    const w = window as unknown as { Plaid?: PlaidGlobal };
+    if (w.Plaid) return resolve(w.Plaid);
+    const existing = document.querySelector(`script[src="${PLAID_LINK_SRC}"]`);
+    const script = (existing as HTMLScriptElement) ?? document.createElement("script");
+    const fail = () => reject(new Error("widget script failed to load"));
+    script.addEventListener("load", () => (w.Plaid ? resolve(w.Plaid) : fail()));
+    script.addEventListener("error", fail);
+    if (!existing) {
+      script.src = PLAID_LINK_SRC;
+      script.async = true;
+      document.head.appendChild(script);
+    }
+  });
+}
+
+function launchBankLinkWidget(
+  linkToken: string,
+  onPublicToken: (publicToken: string, meta?: { institutionId?: string; institutionName?: string }) => void,
+  onUnavailable: (message: string) => void,
+): void {
+  loadPlaidScript()
+    .then((plaid) => {
+      const handler = plaid.create({
+        token: linkToken,
+        onSuccess: (publicToken, metadata) => {
+          onPublicToken(publicToken, {
+            ...(metadata.institution?.institution_id
+              ? { institutionId: metadata.institution.institution_id }
+              : {}),
+            ...(metadata.institution?.name ? { institutionName: metadata.institution.name } : {}),
+          });
+        },
+        onExit: (err) => {
+          if (err) {
+            onUnavailable(
+              err.display_message ?? "The bank connection was not completed. Retry to try again.",
+            );
+          } else {
+            onUnavailable("The bank connection was closed before completing. Retry to try again.");
+          }
+        },
+      });
+      handler.open();
+    })
+    .catch(() => {
+      onUnavailable(
+        "The bank connection widget could not be loaded. Retry later, or contact support.",
+      );
+    });
+}
 
 export function BankLinkDialog({
   applicationId,
@@ -31,7 +127,13 @@ export function BankLinkDialog({
   /** Auth succeeded: session (income evidence for the Step 3 panel). */
   onSession: (session: BankLinkSession) => void;
 }) {
-  const [phase, setPhase] = useState<Phase>("institutions");
+  // CH-025 (INV-054): the server-exposed mode flag gates the flow — the
+  // Link-widget flow renders ONLY under real mode; under simulation the
+  // existing institution-picker + credentials form renders unchanged.
+  const [bankMode] = useState<"simulation" | "real">(() => readBankLinkMode());
+  const [phase, setPhase] = useState<Phase>(
+    bankMode === "real" ? "widget-loading" : "institutions",
+  );
   const [institutions, setInstitutions] = useState<InstitutionInfo[]>([]);
   const [institution, setInstitution] = useState<InstitutionInfo | null>(null);
   const [username, setUsername] = useState("");
@@ -43,6 +145,7 @@ export function BankLinkDialog({
   const dialogRef = useModalFocus<HTMLDivElement>(onClose);
 
   useEffect(() => {
+    if (bankMode === "real") return; // widget flow — no institution roster fetch
     let cancelled = false;
     (async () => {
       const r = await getInstitutions();
@@ -51,7 +154,61 @@ export function BankLinkDialog({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [bankMode]);
+
+  // Real mode: issue the short-lived Link token, then hand it to the Layer-B
+  // widget seam. A 503 (simulation would never reach here; real-unwired is the
+  // contracted retryable outcome) lands in the retryable widget-failed state.
+  const requestLinkToken = useCallback(async () => {
+    setPhase("widget-loading");
+    setError(null);
+    const r = await postBankLinkToken(applicationId, csrfToken);
+    if (r.ok) {
+      setPhase("widget-ready");
+      launchBankLinkWidget(
+        r.data.linkToken,
+        (publicToken, meta) => void completeExchange(publicToken, meta),
+        (message) => {
+          setError(message);
+          setPhase("widget-failed");
+        },
+      );
+    } else {
+      setError(r.error.message);
+      setPhase("widget-failed");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- completeExchange is stable per render cycle; re-creating the callback on session state would relaunch the widget
+  }, [applicationId, csrfToken]);
+
+  useEffect(() => {
+    if (bankMode === "real") void requestLinkToken();
+  }, [bankMode, requestLinkToken]);
+
+  /**
+   * CH-025 Layer-B seam: the widget's success callback exchanges its public
+   * token; the response is the SAME BankLinkSession shape as the credentials
+   * flow, so the account-selection + import surface below is shared unchanged
+   * between modes (INV-054).
+   */
+  const completeExchange = async (
+    publicToken: string,
+    meta?: { institutionId?: string; institutionName?: string },
+  ) => {
+    const r = await postBankLinkExchange(applicationId, csrfToken, {
+      publicToken,
+      ...(meta?.institutionId ? { institutionId: meta.institutionId } : {}),
+      ...(meta?.institutionName ? { institutionName: meta.institutionName } : {}),
+    });
+    if (r.ok) {
+      setSession(r.data);
+      setSelected(new Set(r.data.accounts.map((a) => a.externalAccountId)));
+      onSession(r.data);
+      setPhase("accounts");
+    } else {
+      setError(r.error.message);
+      setPhase("widget-failed");
+    }
+  };
 
   const authenticate = async () => {
     if (!institution) return;
@@ -107,6 +264,46 @@ export function BankLinkDialog({
             ✕
           </button>
         </div>
+
+        {phase === "widget-loading" || phase === "widget-ready" || phase === "widget-failed" ? (
+          // CH-025 (INV-054): real-mode Link-widget flow — renders ONLY when the
+          // server-exposed mode flag reports real mode. The widget itself is
+          // Layer B; until wired, the token request / launch fail-softs into the
+          // retryable state below.
+          <div className="space-y-4" data-testid="bank-link-widget-flow">
+            {phase === "widget-failed" && error ? (
+              <div
+                data-testid="bank-link-widget-error"
+                role="alert"
+                className="rounded-md border border-danger/30 bg-danger-soft px-3 py-2 text-sm text-danger"
+              >
+                {error}
+              </div>
+            ) : null}
+            {phase === "widget-loading" ? (
+              <p data-testid="bank-link-widget-loading" className="text-sm text-muted">
+                Preparing a secure connection to your bank…
+              </p>
+            ) : null}
+            {phase === "widget-ready" ? (
+              <p className="text-sm text-muted">
+                Follow your bank&apos;s prompts in the secure window to continue.
+              </p>
+            ) : null}
+            {phase === "widget-failed" ? (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  data-testid="bank-link-widget-retry"
+                  onClick={() => void requestLinkToken()}
+                  className="rounded-md bg-navy px-4 py-2 text-sm font-semibold text-white transition-colors duration-200 hover:bg-navy-deep"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         {phase === "institutions" ? (
           <div className="space-y-2">

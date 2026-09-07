@@ -79,6 +79,7 @@ import { audit, type AuditTransactionClient } from "@/lib/services/audit";
 import { getNumberSetting } from "@/lib/services/config";
 import { sleep } from "@/lib/services/bank-aggregator";
 import { decryptField } from "@/lib/crypto/encryption";
+import { getStorage } from "@/lib/services/storage";
 import { formatDobDisplay } from "@/lib/crypto/masking";
 import { evaluateOcrTriggers } from "@/lib/services/fraud";
 import { notifyActiveSupervisors } from "@/lib/services/notifications";
@@ -195,6 +196,9 @@ interface JobContext {
   documentType: string;
   fileName: string;
   contentSha256: string;
+  /** CH-025 Layer B: storage location + sniffed type for a real vision backend. */
+  storageKey: string;
+  contentType: string;
 }
 
 async function loadJobContext(jobId: string): Promise<JobContext | null> {
@@ -206,6 +210,8 @@ async function loadJobContext(jobId: string): Promise<JobContext | null> {
           id: true,
           originalFileName: true,
           sha256: true,
+          storageKey: true,
+          sniffedContentType: true,
           document: { select: { id: true, applicationId: true, documentType: true } },
         },
       },
@@ -220,6 +226,8 @@ async function loadJobContext(jobId: string): Promise<JobContext | null> {
     documentType: version.document.documentType,
     fileName: version.originalFileName,
     contentSha256: version.sha256 ?? version.id,
+    storageKey: version.storageKey,
+    contentType: version.sniffedContentType,
   };
 }
 
@@ -491,6 +499,27 @@ export async function processDocumentJobOnce(jobId: string): Promise<ProcessJobR
       attempt,
       referenceDate: new Date(),
       entered: await assembleEnteredData(ctx.applicationId),
+      // CH-025 Layer B: lazy content accessor for real vision backends. The
+      // simulation never calls it; a failed read resolves to null and the
+      // real backend fail-softs retryable. Bytes are read OUTSIDE any DB
+      // transaction, only when the active provider asks.
+      loadContent: async () => {
+        try {
+          const stream = await getStorage().openReadStream(ctx.storageKey);
+          const chunks: Uint8Array[] = [];
+          const reader = stream.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          const bytes = Buffer.concat(chunks);
+          return { bytes, mimeType: ctx.contentType };
+        } catch (err) {
+          console.error(`document-ocr job ${jobId}: content read failed`, err);
+          return null;
+        }
+      },
     };
     outcome = await provider.run(request);
     await sleep(outcome.latencyMs);

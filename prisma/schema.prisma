@@ -694,6 +694,12 @@ model BankLink {
   // Aggregator access token at rest: ciphertext + key id; removed on unlink.
   accessTokenCiphertext Bytes?
   accessTokenKeyId      String?
+  // CH-025 (INV-054): aggregator external ids — additive, nullable, populated
+  // by the real token flow only (Layer B). externalItemId is required for
+  // token revocation at unlink; institutionExternalId is the aggregator's
+  // institution id. No wire-shape change — never serialized.
+  externalItemId        String?
+  institutionExternalId String?
   linkedAt              DateTime  @default(now())
   unlinkedAt            DateTime?
   importedAccountIds    String[]  @default([])

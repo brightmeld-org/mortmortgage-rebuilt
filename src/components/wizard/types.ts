@@ -778,6 +778,16 @@ export interface BankLinkSession {
 }
 
 /**
+ * contracts §A BankLinkTokenResponse (CH-025, INT-023). Issued by
+ * POST /api/applications/:id/bank-links/link-token for the real-mode Link
+ * widget; 503 not-available under simulation (INV-054).
+ */
+export interface BankLinkTokenResponse {
+  linkToken: string;
+  expiration: string;
+}
+
+/**
  * contracts §A BankLinkInfo (CH-018, REQ-039). Carried on Application.bankLinks
  * for ACTIVE links only — an unlinked link is ABSENT from the wire. `id` is the
  * `:linkId` of DELETE /api/applications/:id/bank-links/:linkId (BUG-28).

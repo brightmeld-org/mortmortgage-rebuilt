@@ -2,9 +2,20 @@
 // INV-027, §4.2.10). The simulation itself lives in bank-aggregator.ts /
 // pure/bank-simulation.ts; this module owns the DB side:
 //
-//   createBankLink   — POST   /api/applications/:id/bank-links
-//   importBankLink   — POST   /api/applications/:id/bank-links/:linkId/import
-//   unlinkBankLink   — DELETE /api/applications/:id/bank-links/:linkId
+//   createBankLink       — POST   /api/applications/:id/bank-links
+//   importBankLink       — POST   /api/applications/:id/bank-links/:linkId/import
+//   unlinkBankLink       — DELETE /api/applications/:id/bank-links/:linkId
+//   createBankLinkToken  — POST   /api/applications/:id/bank-links/link-token   (CH-025)
+//   exchangeBankLinkToken— POST   /api/applications/:id/bank-links/exchange     (CH-025)
+//
+// CH-025 (INV-054): the two token-flow operations run behind the
+// BankAggregatorProvider seam (src/lib/services/bank/index.ts) — simulation
+// mode → contracted 503 not-available; real mode with the adapter not yet
+// wired → retryable 503. A successful exchange (Layer B) persists a BankLink
+// with the aggregator's external ids (externalItemId — required for token
+// revocation at unlink — and institutionExternalId) and returns the SAME
+// BankLinkSession shape THROUGH THE SAME serializer as the credentials flow,
+// so import/unlink stay single-pathed across modes.
 //
 // STATE-RULE RESOLUTION (documented decision — contracts §B lists NO 409 for
 // any bank-link endpoint):
@@ -42,6 +53,7 @@ import type { RequestMetaBundle } from "@/lib/http/client-ip";
 import { audit } from "@/lib/services/audit";
 import { createNotification } from "@/lib/services/notifications";
 import { decryptField, encryptField, encryptFieldToJson } from "@/lib/crypto/encryption";
+import { plaidRemoveItem } from "@/lib/services/bank/plaid";
 import { invalidateSignaturesOnDataChange } from "@/lib/services/signature-validity";
 import { computeApplicationQualification } from "@/lib/services/qualification";
 import {
@@ -55,9 +67,11 @@ import {
   isSlowExchange,
   sleep,
 } from "@/lib/services/bank-aggregator";
+import { bankProviderMode, getBankAggregatorProvider } from "@/lib/services/bank";
 import type { DerivedAccount } from "@/lib/pure/bank-simulation";
 import { isBorrowerEditableState } from "@/lib/pure/workflow";
 import type { BankLinkAuthRequest, BankLinkImportRequest } from "@/lib/schemas/bank-link";
+import type { BankLinkExchangeRequest } from "@/lib/services/bank/schemas";
 
 const PROVIDER = "simulated-aggregator";
 
@@ -161,6 +175,26 @@ function toLinkedAccountInfo(account: DerivedAccount, institution: string): Link
   };
 }
 
+/**
+ * THE §A BankLinkSession serializer (CH-025 / INV-054): both the credentials
+ * flow (createBankLink) and the token flow (exchangeBankLinkToken) return
+ * their session through this one function, so the wire shape can never fork
+ * between modes. Never includes token material.
+ */
+function buildBankLinkSession(
+  linkId: string,
+  accounts: DerivedAccount[],
+  institutionName: string,
+  incomeEvidence: IncomeEvidenceInfo | null,
+): BankLinkSessionInfo {
+  const session: BankLinkSessionInfo = {
+    linkId,
+    accounts: accounts.map((a) => toLinkedAccountInfo(a, institutionName)),
+  };
+  if (incomeEvidence) session.incomeEvidence = [incomeEvidence];
+  return session;
+}
+
 type Row = Record<string, unknown>;
 
 function asRowArray(value: Prisma.JsonValue | null | undefined): Row[] {
@@ -252,18 +286,20 @@ export async function createBankLink(
     );
   }
 
+  const incomeEvidence: IncomeEvidenceInfo | null = exchange.incomeEvidence
+    ? {
+        employerName: exchange.incomeEvidence.employerName,
+        employerMatch: exchange.incomeEvidence.employerMatch,
+        averageMonthlyDeposit: exchange.incomeEvidence.averageMonthlyDeposit,
+      }
+    : null;
+
   const payload = sealSessionPayload({
     v: 1,
     token: exchange.accessToken,
     usernameHash: exchange.usernameHash,
     accounts: exchange.accounts,
-    incomeEvidence: exchange.incomeEvidence
-      ? {
-          employerName: exchange.incomeEvidence.employerName,
-          employerMatch: exchange.incomeEvidence.employerMatch,
-          averageMonthlyDeposit: exchange.incomeEvidence.averageMonthlyDeposit,
-        }
-      : null,
+    incomeEvidence,
   });
 
   const linkId = await prisma.$transaction(async (tx) => {
@@ -300,20 +336,125 @@ export async function createBankLink(
     return link.id;
   });
 
-  const session: BankLinkSessionInfo = {
-    linkId,
-    accounts: exchange.accounts.map((a) => toLinkedAccountInfo(a, institution.name)),
-  };
-  if (exchange.incomeEvidence) {
-    session.incomeEvidence = [
-      {
-        employerName: exchange.incomeEvidence.employerName,
-        employerMatch: exchange.incomeEvidence.employerMatch,
-        averageMonthlyDeposit: exchange.incomeEvidence.averageMonthlyDeposit,
+  return buildBankLinkSession(linkId, exchange.accounts, institution.name, incomeEvidence);
+}
+
+// ---------------------------------------------------------------------------
+// createBankLinkToken — POST /api/applications/:id/bank-links/link-token (CH-025)
+// ---------------------------------------------------------------------------
+
+/** contracts §A BankLinkTokenResponse. */
+export interface BankLinkTokenResponseInfo {
+  linkToken: string;
+  expiration: string;
+}
+
+/**
+ * INV-054: issue the short-lived Link token for the client widget, behind the
+ * BankAggregatorProvider seam. Owner-only, same INV-027 denial mapping as
+ * every other bank-link action; permitted in any workflow state (it mutates
+ * nothing — token issuance only, exactly like link creation). Simulation →
+ * contracted 503 not-available; real-unwired → retryable 503.
+ */
+export async function createBankLinkToken(
+  user: SessionUser,
+  applicationId: string,
+): Promise<BankLinkTokenResponseInfo> {
+  const access = await requireBorrowerOwnedAction(user, applicationId);
+  if (!access.allowed) throwBorrowerActionDenial(access.reason);
+
+  const outcome = await getBankAggregatorProvider().createLinkToken(applicationId);
+  if (!outcome.ok) throw new HttpProblem(503, outcome.code, outcome.message);
+  return { linkToken: outcome.linkToken, expiration: outcome.expiration };
+}
+
+// ---------------------------------------------------------------------------
+// exchangeBankLinkToken — POST /api/applications/:id/bank-links/exchange (CH-025)
+// ---------------------------------------------------------------------------
+
+/**
+ * INV-054: exchange the Link widget's public token and return the SAME §A
+ * BankLinkSession shape — through the same serializer — as the credentials
+ * flow, so import/unlink stay single-pathed between modes. The route has
+ * already validated the body (VR-137: publicToken non-empty — an invalid token
+ * is never forwarded to the aggregator). Simulation → contracted 503
+ * not-available; real-unwired → retryable 503. On a Layer-B success the
+ * BankLink row persists the aggregator's external ids (externalItemId for
+ * revocation at unlink, institutionExternalId) beside the ENCRYPTED session
+ * envelope; plaintext token material is never serialized or logged.
+ */
+export async function exchangeBankLinkToken(
+  user: SessionUser,
+  applicationId: string,
+  body: BankLinkExchangeRequest,
+  meta: RequestMetaBundle,
+): Promise<BankLinkSessionInfo> {
+  const access = await requireBorrowerOwnedAction(user, applicationId);
+  if (!access.allowed) throwBorrowerActionDenial(access.reason);
+
+  const provider = getBankAggregatorProvider();
+  const outcome = await provider.exchangePublicToken({
+    publicToken: body.publicToken,
+    institutionId: body.institutionId ?? null,
+    institutionName: body.institutionName ?? null,
+    applicationId,
+  });
+  if (!outcome.ok) throw new HttpProblem(503, outcome.code, outcome.message);
+
+  // Layer-B success path: persist the link exactly like the credentials flow —
+  // encrypted session envelope, owner's primary borrower, in-transaction audit
+  // — plus the two INV-054 external-id columns.
+  const primary = await prisma.borrower.findUnique({
+    where: { applicationId_ordinal: { applicationId, ordinal: 1 } },
+    select: { id: true },
+  });
+
+  const payload = sealSessionPayload({
+    v: 1,
+    token: outcome.accessToken,
+    usernameHash: "", // token flow carries no institution credentials (widget-side auth)
+    accounts: outcome.accounts,
+    incomeEvidence: outcome.incomeEvidence,
+  });
+
+  const linkId = await prisma.$transaction(async (tx) => {
+    const link = await tx.bankLink.create({
+      data: {
+        applicationId,
+        borrowerId: primary?.id ?? null,
+        provider: provider.name,
+        institution: outcome.institutionName,
+        accessTokenCiphertext: payload.ciphertext,
+        accessTokenKeyId: payload.keyId,
+        externalItemId: outcome.itemId,
+        institutionExternalId: outcome.institutionExternalId,
       },
-    ];
-  }
-  return session;
+    });
+    // §4.2.10 "Linking ... audited" — institution + masked metadata only;
+    // never token material or account numbers.
+    await audit(tx, {
+      actor: user.userId,
+      role: user.role,
+      actionType: "bank-link",
+      applicationId,
+      entityType: "BankLink",
+      entityId: link.id,
+      summary: `Bank account link created to ${outcome.institutionName} via token flow (${outcome.accounts.length} account${outcome.accounts.length === 1 ? "" : "s"} available)`,
+      after: {
+        institution: outcome.institutionName,
+        accounts: outcome.accounts.map((a) => ({
+          externalAccountId: a.externalAccountId,
+          accountType: a.accountType,
+          last4: a.last4,
+        })),
+      },
+      ip: meta.ip,
+      requestId: meta.requestId,
+    });
+    return link.id;
+  });
+
+  return buildBankLinkSession(linkId, outcome.accounts, outcome.institutionName, outcome.incomeEvidence);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +639,14 @@ export async function unlinkBankLink(
   const access = await requireBorrowerOwnedAction(user, applicationId);
   if (!access.allowed) throwBorrowerActionDenial(access.reason);
 
-  return prisma.$transaction(async (tx) => {
+  // CH-025 Layer B (INV-054): a REAL-mode link with a persisted external item
+  // id gets its aggregator item revoked upstream. The token is captured
+  // inside the transaction (before XBR-019 removes the ciphertext) and the
+  // revocation fires AFTER commit — best-effort, never a network call inside
+  // a transaction, and never a reason the local unlink fails.
+  let revokeToken: string | null = null;
+
+  const result = await prisma.$transaction(async (tx) => {
     const app = await tx.application.findUnique({
       where: { id: applicationId },
       select: { id: true, applicationNumber: true, workflowState: true },
@@ -546,6 +694,16 @@ export async function unlinkBankLink(
       }
     }
 
+    // CH-025 Layer B: capture the aggregator token for post-commit revocation
+    // (real-mode links only — simulation links have no external item id).
+    if (link.externalItemId && bankProviderMode() === "real") {
+      try {
+        revokeToken = openSessionPayload(link).token;
+      } catch {
+        revokeToken = null; // undecryptable envelope — local unlink proceeds
+      }
+    }
+
     // XBR-019: the encrypted token is REMOVED, not just flagged.
     await tx.bankLink.update({
       where: { id: link.id },
@@ -587,4 +745,11 @@ export async function unlinkBankLink(
 
     return serializeCurrentApplication(tx, applicationId, user.role);
   });
+
+  // Post-commit, best-effort upstream revocation (plaidRemoveItem logs and
+  // swallows its own failures). Awaited so the DELETE response reflects a
+  // completed attempt; the outcome never changes the response.
+  if (revokeToken) await plaidRemoveItem(revokeToken);
+
+  return result;
 }
